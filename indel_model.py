@@ -14,7 +14,7 @@ from sklearn.preprocessing import LabelBinarizer
 
 
 from Bio import Seq, SeqIO
-
+import keras
 from keras.optimizers import SGD, Adam
 from keras.models import Sequential, Model
 from keras.callbacks import ModelCheckpoint, EarlyStopping
