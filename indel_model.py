@@ -20,7 +20,7 @@ from Bio import Seq, SeqIO
 
 from keras.optimizers import SGD, Adam
 from keras.models import Sequential, Model
-from keras.callbacks import ModelCheckpoint, EarlyStopping
+from keras.callbacks import ModelCheckpoint, EarlyStopping, TensorBoard
 from keras.layers import Input, Dense, Dropout, SpatialDropout2D, Flatten, Reshape, merge
 from keras.layers.convolutional import Conv1D, Convolution2D, MaxPooling1D, MaxPooling2D
 
@@ -57,7 +57,8 @@ def main(args):
     history = model.fit(train[0], train[1], batch_size=32, validation_split=0.2, shuffle=True, epochs=10, callbacks=get_callbacks(args.output+".callbacks"))
 
     logger.info("Evaluating model.")
-    pprint(model.evaluate(test[0], test[1]))
+    eval_values = model.evaluate(test[0], test[1])
+    pprint(", ".join(["{}: {}".format(metric,value) for metric, value in zip(model.metrics_names, eval_values)]))
 
     logger.info("Plotting metrics.")
     plot_metric_history(history, args.output + ".metrics_history.pdf", "Indel model")
@@ -266,15 +267,17 @@ def plot_metric_history(history, output, title):
     plt.savefig(output)
 
 
-def get_callbacks(save_weight_hd5, patience=2):
-    checkpointer = ModelCheckpoint(filepath=save_weight_hd5, verbose=1, save_best_only=True)
+def get_callbacks(output_prefix, patience=2, batch_size=32):
+    checkpointer = ModelCheckpoint(filepath=output_prefix + "callbacks", verbose=1, save_best_only=True)
     earlystopper = EarlyStopping(monitor='val_loss', patience=patience, verbose=1)
-    return [checkpointer, earlystopper]
+    tensorboard = TensorBoard(log_dir=output_prefix + "/tensorboard", histogram_freq=1, batch_size=batch_size)
+    return [checkpointer, earlystopper, tensorboard]
 
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
-    parser.add_argument('--ref', help='Reference fasta', required=True)
+    parser.add_argument('--ref', help='Reference pickle', required=True)
+    parser.add_argument('--encode_reference', help='Reference fasta', required=True)
     parser.add_argument('--vcf', help='VCF containing indel training examples', required=True)
     parser.add_argument('--output', help='Output prefix', required=True)
     parser.add_argument('--window_size', help='Size of the window to consider on each side of the indel (default 30).',
