@@ -8,13 +8,16 @@ import logging
 import random
 from collections import defaultdict
 import math
+import matplotlib
+matplotlib.use('agg')
 import matplotlib.pyplot as plt
 from timeit import default_timer as timer
 from sklearn.preprocessing import LabelBinarizer
+from pprint import pprint
 
 
 from Bio import Seq, SeqIO
-import keras
+
 from keras.optimizers import SGD, Adam
 from keras.models import Sequential, Model
 from keras.callbacks import ModelCheckpoint, EarlyStopping
@@ -54,7 +57,7 @@ def main(args):
     history = model.fit(train[0], train[1], batch_size=32, validation_split=0.2, shuffle=True, epochs=10, callbacks=get_callbacks(args.output+".callbacks"))
 
     logger.info("Evaluating model.")
-    model.evaluate(test[0], test[1])
+    pprint(model.evaluate(test[0], test[1]))
 
     logger.info("Plotting metrics.")
     plot_metric_history(history, args.output + ".metrics_history.jpg", "Indel model")
