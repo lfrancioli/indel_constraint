@@ -60,7 +60,7 @@ def main(args):
     pprint(model.evaluate(test[0], test[1]))
 
     logger.info("Plotting metrics.")
-    plot_metric_history(history, args.output + ".metrics_history.jpg", "Indel model")
+    plot_metric_history(history, args.output + ".metrics_history.pdf", "Indel model")
 
 
 def vcf_to_indel_tensors(vcf_path, max_training, window_size, neg_train_window, reference, squash_multi_allelic = False):
@@ -106,8 +106,8 @@ def vcf_to_indel_tensors(vcf_path, max_training, window_size, neg_train_window, 
 
     return np.asarray(indels + negative_training), labels
 
-def encode_reference(ref, encoder):
-    return encoder.transform(list(str(ref.seq)))
+def encode_reference(reference, encoder):
+    return {chrom: encoder.transform(list(str(sequence.seq))) for chrom, sequence in reference.iteritems()}
 
 
 def one_hot_encode(data, encoder):
@@ -227,7 +227,7 @@ def split_data(datasets, subset_ratios, sequential=False):
 
 def plot_metric_history(history, output, title):
     """
-    Plots metrics history as jpg.
+    Plots metrics history as pdf.
 
     :param history:
     :param str output: output file name
