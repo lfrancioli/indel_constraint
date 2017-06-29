@@ -14,7 +14,7 @@ import matplotlib.pyplot as plt
 from timeit import default_timer as timer
 from sklearn.preprocessing import LabelBinarizer
 from pprint import pprint
-
+from os import listdir, makedirs, path
 
 from Bio import Seq, SeqIO
 
@@ -28,18 +28,46 @@ logging.basicConfig(format="%(levelname)s (%(name)s %(lineno)s): %(message)s")
 logger = logging.getLogger("indel")
 logger.setLevel(logging.INFO)
 
-base_dict = {'A': 0, 'C': 1, 'G': 2, 'T': 3}
+BASES = ['A','C','G','T']
+dna_encoder = LabelBinarizer(sparse_output=True).fit(BASES)
 
-amiguity_codes = {'K': [0, 0, 0.5, 0.5], 'M': [0.5, 0.5, 0, 0], 'R': [0.5, 0, 0, 0.5], 'Y': [0, 0.5, 0.5, 0],
-                  'S': [0, 0.5, 0, 0.5], 'W': [0.5, 0, 0.5, 0],
-                  'B': [0, 0.333, 0.333, 0.334], 'V': [0.333, 0.333, 0, 0.334], 'H': [0.333, 0.333, 0.334, 0],
-                  'D': [0.333, 0, 0.333, 0.334],
-                  'X': [0.25, 0.25, 0.25, 0.25], 'N': [0.25, 0.25, 0.25, 0.25]}
+def load_fasta_reference(in_path):
+    contigs = {}
+    logger.info("Reading fasata file {}".format(in_path))
+    start = timer()
+    fasta = SeqIO.to_dict(SeqIO.parse(in_path, "fasta"))
+    logger.info("Reading fasata file loaded in {}.".format(timer() - start))
+    for chrom, sequence in fasta.iteritems():
+        start = timer()
+        logger.info("Encoding chromosome {}".format(chrom))
+        one_hot = dna_encoder.transform(list(str(sequence.seq)))
+        contigs[chrom] = one_hot.astype(np.int8).todense()
+        logger.info("Chrom {} encoded in {}.".format(chrom, timer() - start))
+    return contigs
 
-#TODO something
+def write_bitpacked_reference(reference, out_path):
+    logger.info("Writing reference to {}".format(out_path))
+    if not path.exists(out_path):
+        makedirs(out_path)
+    for contig, sequence in reference.iteritems():
+        np.save(out_path + "/{}.npy".format(contig),np.packbits(sequence))
+
+def load_bitpacked_reference(in_path):
+    logger.info("Loading bitpacked reference from {}".format(in_path))
+    contigs = {}
+    for f in listdir(in_path):
+        if f.endswith(".npy"):
+            packed = np.load(in_path + "/" + f)
+            contigs[f[:-4]] = np.unpackbits(packed).reshape(packed.shape[1]*2,4)
+    return contigs
+
 def main(args):
-    logger.info("Loading reference")
-    reference = SeqIO.to_dict(SeqIO.parse(args.ref, "fasta"))
+    if args.ref_fasta:
+        reference = load_fasta_reference(args.ref_fasta)
+        write_bitpacked_reference(args.ref_fasta + ".bp")
+    else:
+        logger.info("Loading reference pickle")
+        reference = load_bitpacked_reference(args.ref)
 
     logger.info("Loading training data")
     training, labels = vcf_to_indel_tensors(args.vcf, args.max_training, args.window_size, args.neg_train_window, reference)
@@ -67,10 +95,8 @@ def main(args):
 def vcf_to_indel_tensors(vcf_path, max_training, window_size, neg_train_window, reference, squash_multi_allelic = False):
     indels = []
     positive_training_pos = defaultdict(dict)
-    ref_tensors = {}
 
     vcf_reader = vcf.Reader(open(vcf_path, 'r'))
-    lb = LabelBinarizer().fit(['A','C','G','T'])
 
     # Get positive training examples
     start = timer()
@@ -80,10 +106,7 @@ def vcf_to_indel_tensors(vcf_path, max_training, window_size, neg_train_window, 
 
         if not variant.is_snp and not (squash_multi_allelic and variant.POS in positive_training_pos[variant.CHROM]):
             pos = variant.POS
-            if variant.CHROM not in ref_tensors:
-                logger.info("One-hot-encoding reference chrom {}".format(variant.CHROM))
-                ref_tensors[variant.CHROM] = lb.transform(list(str(reference[variant.CHROM].seq)))
-            indels.append(ref_tensors[variant.CHROM][pos - window_size: pos + window_size + 1])
+            indels.append(reference[variant.CHROM][pos - window_size: pos + window_size + 1])
             while pos in positive_training_pos[variant.CHROM]:
                 pos+=1
             positive_training_pos[variant.CHROM][pos] = 1
@@ -95,7 +118,7 @@ def vcf_to_indel_tensors(vcf_path, max_training, window_size, neg_train_window, 
     negative_training = []
     for chrom, positions in positive_training_pos.iteritems():
         for pos in get_negative_positions(positions, neg_train_window):
-            negative_training.append(ref_tensors[chrom][pos - window_size: pos + window_size + 1])
+            negative_training.append(reference[chrom][pos - window_size: pos + window_size + 1])
 
     logger.info("Negative training examples loaded in {}.".format(timer() - start))
     # Create labels
@@ -106,10 +129,6 @@ def vcf_to_indel_tensors(vcf_path, max_training, window_size, neg_train_window, 
         ), axis=0)
 
     return np.asarray(indels + negative_training), labels
-
-def encode_reference(reference, encoder):
-    return {chrom: encoder.transform(list(str(sequence.seq))) for chrom, sequence in reference.iteritems()}
-
 
 def one_hot_encode(data, encoder):
     all_data = "".join(data)
@@ -132,7 +151,7 @@ def get_negative_positions(positions, neg_train_window):
 
 
 def make_indel_model(window_size):
-    indel = Input(shape=(2 * window_size + 1, len(base_dict)), name="indel")
+    indel = Input(shape=(2 * window_size + 1, len(BASES)), name="indel")
     x = Conv1D(filters=200, kernel_size=12, activation="relu", kernel_initializer='glorot_normal')(indel)
     x = Dropout(0.2)(x)
     x = Conv1D(filters=200, kernel_size=12, activation="relu", kernel_initializer='glorot_normal')(x)
@@ -268,7 +287,7 @@ def plot_metric_history(history, output, title):
 
 
 def get_callbacks(output_prefix, patience=2, batch_size=32):
-    checkpointer = ModelCheckpoint(filepath=output_prefix + "callbacks", verbose=1, save_best_only=True)
+    checkpointer = ModelCheckpoint(filepath=output_prefix + ".callbacks", verbose=1, save_best_only=True)
     earlystopper = EarlyStopping(monitor='val_loss', patience=patience, verbose=1)
     tensorboard = TensorBoard(log_dir=output_prefix + "/tensorboard", histogram_freq=1, batch_size=batch_size)
     return [checkpointer, earlystopper, tensorboard]
@@ -276,8 +295,8 @@ def get_callbacks(output_prefix, patience=2, batch_size=32):
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
-    parser.add_argument('--ref', help='Reference pickle', required=True)
-    parser.add_argument('--encode_reference', help='Reference fasta', required=True)
+    parser.add_argument('--ref', help='One-hot-enoded reference pickle (required if not using --ref_fasta)', required=False)
+    parser.add_argument('--ref_fasta', help='Reference fasta. If used, the reference will be one-hot-encoded and saved as a npy files. (required if not using --ref)', required=False)
     parser.add_argument('--vcf', help='VCF containing indel training examples', required=True)
     parser.add_argument('--output', help='Output prefix', required=True)
     parser.add_argument('--window_size', help='Size of the window to consider on each side of the indel (default 30).',
@@ -289,4 +308,8 @@ if __name__ == '__main__':
                         help='Size of the window to consider on each side of the indel to sample a negative training example (default 1000).',
                         required=False, default=1000, type=int)
     args = parser.parse_args()
+
+    if int(args.ref_fasta is not None) + int(args.ref is not None) != 1:
+        sys.exit("One and only one of --ref_fasta or --ref is required.")
+
     main(args)
