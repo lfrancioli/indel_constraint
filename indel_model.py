@@ -64,7 +64,7 @@ def load_bitpacked_reference(in_path):
 def main(args):
     if args.ref_fasta:
         reference = load_fasta_reference(args.ref_fasta)
-        write_bitpacked_reference(args.ref_fasta + ".bp")
+        write_bitpacked_reference(reference, args.ref_fasta + ".bp")
     else:
         logger.info("Loading reference pickle")
         reference = load_bitpacked_reference(args.ref)
