@@ -15,13 +15,14 @@ from timeit import default_timer as timer
 from sklearn.preprocessing import LabelBinarizer
 from pprint import pprint
 from os import listdir, makedirs, path
+import pickle
 
 from Bio import Seq, SeqIO
 
 from keras.optimizers import SGD, Adam
 from keras.models import Sequential, Model
 from keras.callbacks import ModelCheckpoint, EarlyStopping, TensorBoard
-from keras.layers import Input, Dense, Dropout, SpatialDropout2D, Flatten, Reshape, merge
+from keras.layers import Input, Dense, Dropout, SpatialDropout2D, Flatten, Reshape, merge, SpatialDropout1D
 from keras.layers.convolutional import Conv1D, Convolution2D, MaxPooling1D, MaxPooling2D
 
 logging.basicConfig(format="%(levelname)s (%(name)s %(lineno)s): %(message)s")
@@ -31,104 +32,187 @@ logger.setLevel(logging.INFO)
 BASES = ['A','C','G','T']
 dna_encoder = LabelBinarizer(sparse_output=True).fit(BASES)
 
+def overlaps_intervals(intervals, start, stop):
+    interval_start = np.searchsorted(intervals[:, 0], start)
+    interval_stop = np.searchsorted(intervals[:, 0], stop)
+
+    return (
+        interval_start != interval_stop or
+        start < intervals[interval_start - 1][1] or intervals[interval_start][0] == start or
+        stop < intervals[interval_stop - 1][1] or intervals[interval_stop][0] == stop
+    )
+
+
+def in_intervals(intervals, value):
+    interval_index = np.searchsorted(intervals[:, 0], value)
+    return value < intervals[interval_index - 1][1] or intervals[interval_index][0] == value
+
+
+def rle_encode_ambiguous(seq_list):
+    ambiguous_indices = np.invert(np.in1d(seq_list, np.array(BASES, dtype='|S1')))
+    pos, = np.where(np.diff(ambiguous_indices) != 0)
+    pos = np.concatenate(([0], pos + 1, [len(ambiguous_indices)]))
+    return np.array([(a, b) for (a, b) in zip(pos[:-1], pos[1:]) if ambiguous_indices[a]])
+
+
 def load_fasta_reference(in_path):
-    contigs = {}
-    logger.info("Reading fasata file {}".format(in_path))
+    reference = {}
+    ambiguous_bases = {}
+    logger.info("Reading fasta file {}".format(in_path))
     start = timer()
     fasta = SeqIO.to_dict(SeqIO.parse(in_path, "fasta"))
     logger.info("Reading fasata file loaded in {}.".format(timer() - start))
-    for chrom, sequence in fasta.iteritems():
+    for contig, sequence in fasta.iteritems():
         start = timer()
-        logger.info("Encoding chromosome {}".format(chrom))
-        one_hot = dna_encoder.transform(list(str(sequence.seq)))
-        contigs[chrom] = one_hot.astype(np.int8).todense()
-        logger.info("Chrom {} encoded in {}.".format(chrom, timer() - start))
-    return contigs
+        logger.info("Encoding chromosome {}".format(contig))
+        seq_list = list(str(sequence.seq))
+        #one_hot = dna_encoder.transform(seq_list)
+        #reference[contig] = one_hot.astype(np.int8).todense()
+        ambiguous_bases[contig] = rle_encode_ambiguous(seq_list)
+        logger.info("Chrom {} encoded in {}.".format(contig, timer() - start))
+    return reference, ambiguous_bases
 
-def write_bitpacked_reference(reference, out_path):
+
+def write_bitpacked_reference(reference, ambiguous_bases, out_path):
     logger.info("Writing reference to {}".format(out_path))
     if not path.exists(out_path):
         makedirs(out_path)
     for contig, sequence in reference.iteritems():
-        np.save(out_path + "/{}.npy".format(contig),np.packbits(sequence))
+        np.save(out_path + "/{}.npy".format(contig), np.packbits(sequence))
+    pickle.dump(ambiguous_bases, open(out_path + "/ambiguous_bases.pickle", "w"))
+
 
 def load_bitpacked_reference(in_path):
+    start = timer()
     logger.info("Loading bitpacked reference from {}".format(in_path))
-    contigs = {}
+    reference = {}
     for f in listdir(in_path):
         if f.endswith(".npy"):
             packed = np.load(in_path + "/" + f)
-            contigs[f[:-4]] = np.unpackbits(packed).reshape(packed.shape[1]*2,4)
-    return contigs
+            reference[f[:-4]] = np.unpackbits(packed).reshape(packed.shape[1]*2, 4)
+
+    ambiguous_bases = pickle.load(open(in_path + "/ambiguous_bases.pickle", "r"))
+
+    for contig in reference:
+        if contig not in ambiguous_bases:
+            logger.warn("No ambiguous bases indices found for contig {}.".format(contig))
+
+    logger.info("Reference loaded in {}.".format(timer() - start))
+    return reference, ambiguous_bases
+
 
 def main(args):
     if args.ref_fasta:
-        reference = load_fasta_reference(args.ref_fasta)
-        write_bitpacked_reference(reference, args.ref_fasta + ".bp")
+        reference, ambiguous_bases = load_fasta_reference(args.ref_fasta)
+        write_bitpacked_reference(reference, ambiguous_bases, args.ref_fasta + ".bp")
     else:
-        logger.info("Loading reference pickle")
-        reference = load_bitpacked_reference(args.ref)
+        reference, ambiguous_bases = load_bitpacked_reference(args.ref)
+
+    indels = read_vcf(args.vcf, args.max_training)
 
     logger.info("Loading training data")
-    training, labels = vcf_to_indel_tensors(args.vcf, args.max_training, args.window_size, args.neg_train_window, reference)
+    training, labels, indel_alleles = vcf_to_indel_tensors(indels, reference, ambiguous_bases, args.window_size, args.neg_train_window)
     logger.info("Loaded training examples with dimensions {}.".format(str(training.shape)))
 
     logger.info("Splitting training data into training and testing sets.")
-    train, test = split_data([training,labels], [0.8,0.2])
+    train, test = split_data([training, labels, indel_alleles], [0.8,0.2])
 
     logger.info("Training shape: {}, labels shape: {}".format(train[0].shape, train[1].shape))
 
     logger.info("Creating model")
     model = make_indel_model(args.window_size)
 
-    logger.info("Training model.")
-    history = model.fit(train[0], train[1], batch_size=32, validation_split=0.2, shuffle=True, epochs=10, callbacks=get_callbacks(args.output+".callbacks"))
+    if args.train_model:
+        logger.info("Training model.")
+        if args.callback:
+            model.load_weights(args.callback, by_name=True)
+        history = model.fit(train[0], train[1], batch_size=32, validation_split=0.2, shuffle=True, epochs=10, callbacks=get_callbacks(args.output+".callbacks"))
+
+        logger.info("Plotting metrics.")
+        plot_metric_history(history, args.output + ".metrics_history.pdf", "Indel model")
+    else:
+        model.load_weights(args.callback, by_name=True)
 
     logger.info("Evaluating model.")
     eval_values = model.evaluate(test[0], test[1])
     pprint(", ".join(["{}: {}".format(metric,value) for metric, value in zip(model.metrics_names, eval_values)]))
 
-    logger.info("Plotting metrics.")
-    plot_metric_history(history, args.output + ".metrics_history.pdf", "Indel model")
+    if args.save_best_examples:
+        logger.info("Saving best scoring training examples")
+        positive_examples, negative_examples = get_best_scoring_training_examples(model, train)
+        file = open(args.output + ".best_training_examples.tsv",'w')
+        for seq, score, label, alleles in positive_examples + negative_examples:
+            file.write("{}\t{}\t{}\t{}\t{}\t{:.3f}\t{}\n".format(seq[:30], seq[30], seq[31:], alleles[0], alleles[1], score, label))
+        file.close()
 
 
-def vcf_to_indel_tensors(vcf_path, max_training, window_size, neg_train_window, reference, squash_multi_allelic = False):
-    indels = []
-    positive_training_pos = defaultdict(dict)
-
-    vcf_reader = vcf.Reader(open(vcf_path, 'r'))
+def read_vcf(vcf_path, max_training):
+    logger.info("Loadind indels from VCF {}.".format(vcf_path))
+    file = open(vcf_path, 'r')
+    vcf_reader = vcf.Reader(file)
+    indels = defaultdict(list)
 
     # Get positive training examples
     start = timer()
+    n_indels = 0
     for variant in vcf_reader:
-        if max_training >= 0 and len(indels) >= max_training:
+        if max_training >= 0 and n_indels >= max_training:
             break
 
-        if not variant.is_snp and not (squash_multi_allelic and variant.POS in positive_training_pos[variant.CHROM]):
-            pos = variant.POS
-            indels.append(reference[variant.CHROM][pos - window_size: pos + window_size + 1])
-            while pos in positive_training_pos[variant.CHROM]:
-                pos+=1
-            positive_training_pos[variant.CHROM][pos] = 1
+        if not variant.is_snp:
+            indels[variant.CHROM].append(variant)
+            n_indels += 1
 
-    logger.info("Positive training examples loaded in {}.".format(timer() - start))
+    logger.info("Loaded {} indels from VCF in {}.".format(sum([len(x) for x in indels.values()]), timer() - start))
+    file.close()
+    return indels
 
-    # Get negative training examples
-    start = timer()
+def vcf_to_indel_tensors(indels, reference, ambiguous_bases, window_size, neg_train_window, squash_multi_allelic = False):
+    positive_training = []
     negative_training = []
-    for chrom, positions in positive_training_pos.iteritems():
-        for pos in get_negative_positions(positions, neg_train_window):
-            negative_training.append(reference[chrom][pos - window_size: pos + window_size + 1])
+    labels = np.array([],dtype=np.int8)
+    #indel_positions = {}
+    indel_alleles = []
 
-    logger.info("Negative training examples loaded in {}.".format(timer() - start))
-    # Create labels
-    labels = np.concatenate(
-        (
-            np.full((len(indels), 2), np.array([0, 1])),  # positive labels
-            np.full((len(negative_training), 2), np.array([1, 0]))  # negative labels
-        ), axis=0)
+    # Get positive training examples
+    start = timer()
+    for contig, variants in indels.iteritems():
+        positive_training_pos = {}
+        #indel_positions[contig] = []
+        for i, variant in enumerate(variants):
+            if not variant.is_snp and not (squash_multi_allelic and variant.POS in positive_training_pos):
+                pos = variant.POS
+                positive_training.append(reference[contig][pos - window_size: pos + window_size + 1])
+                #indel_positions[contig].append(i)
+                indel_alleles.append([variant.REF, ",".join([str(x) for x in variant.ALT])])
+                while pos in positive_training_pos: # A bit of a trick for multi-allelic indels, but should be fine
+                    pos+=1
+                positive_training_pos[pos] = 1
 
-    return np.asarray(indels + negative_training), labels
+        # Get negative training examples
+        if neg_train_window > 0:
+            for pos in get_negative_positions(positive_training_pos, ambiguous_bases[contig], neg_train_window):
+                negative_training.append(reference[contig][pos - window_size: pos + window_size + 1])
+                indel_alleles.append([tensor_to_str(reference[contig][pos:pos+1]), ""])
+        else:
+            #Samples randomly on the chromosome. Note that this procedure can lead to duplicate positions
+            neg_positions = []
+            while len(neg_positions) < len(positive_training_pos):
+                new_neg_positions = [x for x in
+                                     random.sample(xrange(len(reference[contig])), len(positive_training_pos) - len(neg_positions))
+                                     if x not in positive_training_pos and not in_intervals(ambiguous_bases[contig], x)]
+                neg_positions.extend(new_neg_positions)
+                indel_alleles.extend([[b,""] for b in list(tensor_to_str(reference[contig][new_neg_positions]))])
+
+        labels = np.append(labels,
+                                np.append(np.full(len(positive_training_pos), 1, dtype=np.int8),
+                                               np.zeros(len(positive_training_pos), dtype=np.int8)
+                                               )
+                                )
+
+    logger.info("Training examples loaded in {}.".format(timer() - start))
+
+    return np.asarray(positive_training + negative_training), labels, np.asarray(indel_alleles)
 
 def one_hot_encode(data, encoder):
     all_data = "".join(data)
@@ -142,10 +226,10 @@ def get_training_tensor(chrom, pos, reference, window_size, encoder):
     return encoder.transform(list(record))
 
 
-def get_negative_positions(positions, neg_train_window):
+def get_negative_positions(positions, ambiguous_bases, neg_train_window):
     for pos in positions.keys():
         neg_pos = random.randint(pos - neg_train_window, pos + neg_train_window)
-        while neg_pos in positions:
+        while neg_pos in positions or in_intervals(ambiguous_bases, neg_pos):
             neg_pos = random.randint(pos - neg_train_window, pos + neg_train_window)
         yield neg_pos
 
@@ -153,14 +237,14 @@ def get_negative_positions(positions, neg_train_window):
 def make_indel_model(window_size):
     indel = Input(shape=(2 * window_size + 1, len(BASES)), name="indel")
     x = Conv1D(filters=200, kernel_size=12, activation="relu", kernel_initializer='glorot_normal')(indel)
-    x = Dropout(0.2)(x)
+    x = SpatialDropout1D(0.2)(x)
     x = Conv1D(filters=200, kernel_size=12, activation="relu", kernel_initializer='glorot_normal')(x)
     x = Dropout(0.2)(x)
     x = Conv1D(filters=100, kernel_size=12, activation="relu", kernel_initializer='glorot_normal')(x)
     x = Dropout(0.2)(x)
     x = Flatten()(x)
     x = Dense(units=64, kernel_initializer='normal', activation='relu')(x)
-    prob_output = Dense(units=2, kernel_initializer='normal', activation='softmax')(x)
+    prob_output = Dense(units=1, kernel_initializer='normal', activation='softmax')(x)
 
     model = Model(inputs=[indel], outputs=[prob_output])
 
@@ -293,9 +377,55 @@ def get_callbacks(output_prefix, patience=2, batch_size=32):
     return [checkpointer, earlystopper, tensorboard]
 
 
+def tensor_to_str(tensor):
+    return "".join(dna_encoder.inverse_transform(tensor))
+
+
+def get_best_scoring_training_examples(model, training_data, n_best = 50):
+
+    probs = model.predict(training_data[0]).flatten()
+
+    # Best scoring positive training examples
+    best_scoring_indices = np.argpartition(probs,-n_best)[-n_best:]
+    positive_examples = zip(
+        [tensor_to_str(t) for t in training_data[0][best_scoring_indices]],
+        probs[best_scoring_indices].tolist(),
+        training_data[1][best_scoring_indices],
+        training_data[2][best_scoring_indices])
+
+    # Best scoring negative training examples
+    best_scoring_indices = np.argpartition(probs,n_best)[:n_best]
+    negative_examples = zip(
+        [tensor_to_str(t) for t in training_data[0][best_scoring_indices]],
+        probs[best_scoring_indices].tolist(),
+        training_data[1][best_scoring_indices],
+        training_data[2][best_scoring_indices]
+    )
+
+    return positive_examples, negative_examples
+
+
+def apply_model(indels, model, reference, ambiguous_bases, window_size = 1000):
+    result = {}
+    for chrom, positions in reference.iteritems():
+        if not indels[chrom]:
+            logger.info("Skipping chromosome {} as no indels found in VCF.".format(chrom))
+        else:
+            chrom_size = reference[chrom].shape(0)
+            i = 0
+            #TODO: Skip N's and ambiguous bases
+            #Read from VCF
+            while i < chrom_size - window_size:
+                if overlaps_intervals(ambiguous_bases,i, i+window_size):
+                    continue
+                pred = model.predict(positions[i:i+window_size])
+                i+= window_size
+
+
+
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
-    parser.add_argument('--ref', help='One-hot-enoded reference pickle (required if not using --ref_fasta)', required=False)
+    parser.add_argument('--ref', help='One-hot-encoded reference (required if not using --ref_fasta)', required=False)
     parser.add_argument('--ref_fasta', help='Reference fasta. If used, the reference will be one-hot-encoded and saved as a npy files. (required if not using --ref)', required=False)
     parser.add_argument('--vcf', help='VCF containing indel training examples', required=True)
     parser.add_argument('--output', help='Output prefix', required=True)
@@ -305,11 +435,19 @@ if __name__ == '__main__':
                         help='Maximum number of training examples to use for each class (default 100,000). Set to -1 to use all.',
                         required=False, default=100000, type=int)
     parser.add_argument('--neg_train_window',
-                        help='Size of the window to consider on each side of the indel to sample a negative training example (default 1000).',
+                        help='Size of the window to consider on each side of the indel to sample a negative training example (default 1000). If set to a value < 1 => select a random position on the same chromosome.',
                         required=False, default=1000, type=int)
+    parser.add_argument('--train_model', help='Trains a new model. Required if not using --callback.', required=False,
+                        action='store_true')
+    parser.add_argument('--callback', help='When specified, will initialize the model weights with the given callback.', required=False)
+    parser.add_argument('--save_best_examples', help='When specified, saves the best training examples (for each class).',
+                        action='store_true', required=False)
     args = parser.parse_args()
 
     if int(args.ref_fasta is not None) + int(args.ref is not None) != 1:
         sys.exit("One and only one of --ref_fasta or --ref is required.")
+
+    if not args.train_model and not args.callback:
+        sys.exit("Must specify --callback when not using --train_model.")
 
     main(args)
