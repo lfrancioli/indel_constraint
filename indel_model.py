@@ -144,7 +144,8 @@ def main(args):
         for seq, score, label, indel_index in positive_examples + negative_examples:
             ref = indels[indel_index].REF if indel_index > -1 else seq[30]
             alt = ",".join([str(a) for a in indels[indel_index].ALT]) if indel_index > -1 else "null"
-            file.write("{}\t{}\t{}\t{}\t{}\t{:.3f}\t{}\n".format(seq[:30], seq[30], seq[31:], ref, alt, score, label))
+            training_label = "indel" if label[0] == 1 else "no_indel"
+            file.write("{}\t{}\t{}\t{}\t{}\t{:.3f}\t{}\n".format(seq[:30], seq[30], seq[31:], ref, alt, score, training_label))
         file.close()
 
 
@@ -172,7 +173,7 @@ def read_vcf(vcf_path, max_training):
 def vcf_to_indel_tensors(indels, reference, ambiguous_bases, window_size, neg_train_window, squash_multi_allelic = False):
     positive_training = []
     negative_training = []
-    labels = np.array([],dtype=np.int8)
+    labels = np.empty((0,2),dtype=np.int8)
     indel_indices = []
 
     # Get positive training examples
@@ -200,11 +201,16 @@ def vcf_to_indel_tensors(indels, reference, ambiguous_bases, window_size, neg_tr
                                                      ))
 
             indel_indices.extend([-1]*len(positive_training_pos))
-            labels = np.append(labels,
-                                    np.append(np.full(len(positive_training_pos), 1, dtype=np.int8),
-                                                   np.zeros(len(positive_training_pos), dtype=np.int8)
-                                                   )
-                                    )
+            labels = np.append(
+                labels,
+                np.concatenate(
+                (
+                    np.full((len(positive_training_pos), 2), np.array([1, 0])),  # positive labels
+                    np.full((len(positive_training_pos), 2), np.array([0, 1]))  # negative labels
+                ), axis=0),
+                axis=0
+            )
+
             positive_training_pos = {}
             contig = variant.CHROM
 
@@ -261,7 +267,7 @@ def make_indel_model(window_size):
     x = Dropout(0.2)(x)
     x = Flatten()(x)
     x = Dense(units=64, kernel_initializer='normal', activation='relu')(x)
-    prob_output = Dense(units=1, kernel_initializer='normal', activation='softmax')(x)
+    prob_output = Dense(units=2, kernel_initializer='normal', activation='softmax')(x)
 
     model = Model(inputs=[indel], outputs=[prob_output])
 
@@ -400,7 +406,7 @@ def tensor_to_str(tensor):
 
 def get_best_scoring_training_examples(model, training_data, n_best = 50):
 
-    probs = model.predict(training_data[0]).flatten()
+    probs = model.predict(training_data[0])[:,0]
 
     # Best scoring positive training examples
     best_scoring_indices = np.argpartition(probs,-n_best)[-n_best:]
