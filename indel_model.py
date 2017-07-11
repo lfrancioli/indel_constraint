@@ -111,11 +111,11 @@ def main(args):
     indels = read_vcf(args.vcf, args.max_training)
 
     logger.info("Loading training data")
-    training, labels, indel_alleles = vcf_to_indel_tensors(indels, reference, ambiguous_bases, args.window_size, args.neg_train_window)
-    logger.info("Loaded training examples with dimensions {}.".format(str(training.shape)))
+    training, labels, indel_indices = vcf_to_indel_tensors(indels, reference, ambiguous_bases, args.window_size, args.neg_train_window)
+    logger.info("Loaded training examples with dimensions {}, labels with dimensions: {} and indel indices with dimesions: {}.".format(str(training.shape), str(labels.shape), str(indel_indices.shape)))
 
     logger.info("Splitting training data into training and testing sets.")
-    train, test = split_data([training, labels, indel_alleles], [0.8,0.2])
+    train, test = split_data([training, labels, indel_indices], [0.8,0.2])
 
     logger.info("Training shape: {}, labels shape: {}".format(train[0].shape, train[1].shape))
 
@@ -141,8 +141,10 @@ def main(args):
         logger.info("Saving best scoring training examples")
         positive_examples, negative_examples = get_best_scoring_training_examples(model, train)
         file = open(args.output + ".best_training_examples.tsv",'w')
-        for seq, score, label, alleles in positive_examples + negative_examples:
-            file.write("{}\t{}\t{}\t{}\t{}\t{:.3f}\t{}\n".format(seq[:30], seq[30], seq[31:], alleles[0], alleles[1], score, label))
+        for seq, score, label, indel_index in positive_examples + negative_examples:
+            ref = indels[indel_index].REF if indel_index > -1 else seq[30]
+            alt = ",".join([str(a) for a in indels[indel_index].ALT]) if indel_index > -1 else "null"
+            file.write("{}\t{}\t{}\t{}\t{}\t{:.3f}\t{}\n".format(seq[:30], seq[30], seq[31:], ref, alt, score, label))
         file.close()
 
 
@@ -150,7 +152,7 @@ def read_vcf(vcf_path, max_training):
     logger.info("Loadind indels from VCF {}.".format(vcf_path))
     file = open(vcf_path, 'r')
     vcf_reader = vcf.Reader(file)
-    indels = defaultdict(list)
+    indels = []
 
     # Get positive training examples
     start = timer()
@@ -160,10 +162,10 @@ def read_vcf(vcf_path, max_training):
             break
 
         if not variant.is_snp:
-            indels[variant.CHROM].append(variant)
+            indels.append(variant)
             n_indels += 1
 
-    logger.info("Loaded {} indels from VCF in {}.".format(sum([len(x) for x in indels.values()]), timer() - start))
+    logger.info("Loaded {} indels from VCF in {}.".format(len(indels), timer() - start))
     file.close()
     return indels
 
@@ -171,48 +173,44 @@ def vcf_to_indel_tensors(indels, reference, ambiguous_bases, window_size, neg_tr
     positive_training = []
     negative_training = []
     labels = np.array([],dtype=np.int8)
-    #indel_positions = {}
-    indel_alleles = []
+    indel_indices = []
 
     # Get positive training examples
     start = timer()
-    for contig, variants in indels.iteritems():
-        positive_training_pos = {}
-        #indel_positions[contig] = []
-        for i, variant in enumerate(variants):
-            if not variant.is_snp and not (squash_multi_allelic and variant.POS in positive_training_pos):
-                pos = variant.POS
-                positive_training.append(reference[contig][pos - window_size: pos + window_size + 1])
-                #indel_positions[contig].append(i)
-                indel_alleles.append([variant.REF, ",".join([str(x) for x in variant.ALT])])
-                while pos in positive_training_pos: # A bit of a trick for multi-allelic indels, but should be fine
-                    pos+=1
-                positive_training_pos[pos] = 1
+    positive_training_pos = {}
+    contig = indels[0].CHROM
+    for i, variant in enumerate(indels):
+        #Get positive training examples
+        if not variant.is_snp and not (squash_multi_allelic and variant.POS in positive_training_pos):
+            pos = variant.POS
+            positive_training.append(reference[contig][pos - window_size -1: pos + window_size])
+            indel_indices.append(i)
+            while pos in positive_training_pos: # A bit of a trick for multi-allelic indels, but should be fine
+                pos+=1
+            positive_training_pos[pos] = 1
 
-        # Get negative training examples
-        if neg_train_window > 0:
-            for pos in get_negative_positions(positive_training_pos, ambiguous_bases[contig], neg_train_window):
-                negative_training.append(reference[contig][pos - window_size: pos + window_size + 1])
-                indel_alleles.append([tensor_to_str(reference[contig][pos:pos+1]), ""])
-        else:
-            #Samples randomly on the chromosome. Note that this procedure can lead to duplicate positions
-            neg_positions = []
-            while len(neg_positions) < len(positive_training_pos):
-                new_neg_positions = [x for x in
-                                     random.sample(xrange(len(reference[contig])), len(positive_training_pos) - len(neg_positions))
-                                     if x not in positive_training_pos and not in_intervals(ambiguous_bases[contig], x)]
-                neg_positions.extend(new_neg_positions)
-                indel_alleles.extend([[b,""] for b in list(tensor_to_str(reference[contig][new_neg_positions]))])
+        if i+1 == len(indels) or indels[i+1].CHROM != variant.CHROM:
+            print i
+            # Get negative training examples
+            negative_training.extend(get_negative_training_tensors(positive_training_pos,
+                                                     ambiguous_bases[contig],
+                                                     neg_train_window,
+                                                     reference[contig],
+                                                     window_size
+                                                     ))
 
-        labels = np.append(labels,
-                                np.append(np.full(len(positive_training_pos), 1, dtype=np.int8),
-                                               np.zeros(len(positive_training_pos), dtype=np.int8)
-                                               )
-                                )
+            indel_indices.extend([-1]*len(positive_training_pos))
+            labels = np.append(labels,
+                                    np.append(np.full(len(positive_training_pos), 1, dtype=np.int8),
+                                                   np.zeros(len(positive_training_pos), dtype=np.int8)
+                                                   )
+                                    )
+            positive_training_pos = {}
+            contig = variant.CHROM
 
     logger.info("Training examples loaded in {}.".format(timer() - start))
 
-    return np.asarray(positive_training + negative_training), labels, np.asarray(indel_alleles)
+    return np.asarray(positive_training + negative_training), labels, np.asarray(indel_indices)
 
 def one_hot_encode(data, encoder):
     all_data = "".join(data)
@@ -226,12 +224,31 @@ def get_training_tensor(chrom, pos, reference, window_size, encoder):
     return encoder.transform(list(record))
 
 
-def get_negative_positions(positions, ambiguous_bases, neg_train_window):
-    for pos in positions.keys():
-        neg_pos = random.randint(pos - neg_train_window, pos + neg_train_window)
-        while neg_pos in positions or in_intervals(ambiguous_bases, neg_pos):
+def get_negative_training_tensors(positions, ambiguous_bases, neg_train_window, reference, window_size, max_retry = 100):
+    max_pos = len(reference) - window_size
+    neg_positions = []
+    if neg_train_window > 0:
+        for pos in positions.keys():
             neg_pos = random.randint(pos - neg_train_window, pos + neg_train_window)
-        yield neg_pos
+            i = 0
+            while (neg_pos in positions or in_intervals(ambiguous_bases, neg_pos) or neg_pos > max_pos or neg_pos < window_size) and i < max_retry:
+                neg_pos = random.randint(pos - neg_train_window, pos + neg_train_window)
+                i+=1
+
+            if i == max_retry:
+                logger.warn("No suitable negative training position found for positive training example {}. Skipping.".format(pos))
+            else:
+                neg_positions.append(neg_pos)
+    else:
+        # Samples randomly on the chromosome. Note that this procedure can lead to duplicate positions
+        while len(neg_positions) < len(positions):
+            new_neg_positions = [x for x in
+                                 random.sample(xrange(window_size, max_pos),
+                                               len(positions) - len(neg_positions))
+                                 if x not in positions and not in_intervals(ambiguous_bases, x)]
+            neg_positions.extend(new_neg_positions)
+
+    return [reference[neg_pos - window_size -1: neg_pos + window_size] for neg_pos in neg_positions]
 
 
 def make_indel_model(window_size):
