@@ -437,7 +437,7 @@ def tensor_to_str(tensor):
 
 def get_best_scoring_training_examples(model, training_data, n_best = 50):
 
-    probs = model.predict(training_data[0])[:,0]
+    probs = model.predict(training_data[0], verbose=1)[:,0]
 
     # Best scoring positive training examples
     best_scoring_indices = np.argpartition(probs,-n_best)[-n_best:]
@@ -464,7 +464,7 @@ def apply_model(model, reference_contig, window_size):
     start = timer()
     tensors = np.asarray([ reference_contig[i - window_size -1: i + window_size] for
                 i in range(window_size + 1, len(reference_contig) - window_size)])
-    predictions = model.predict(tensors)[:,0].astype(np.float16)
+    predictions = model.predict(tensors, verbose=1)[:,0].astype(np.float16)
     predictions = np.append(np.zeros(window_size + 1, dtype=np.float16), predictions)
     predictions = np.append(predictions, np.zeros(window_size, dtype=np.float16))
     logger.info("Computed {} predictions in {}.".format(len(predictions), timer() - start))
@@ -500,7 +500,7 @@ def apply_model_binned(indels, indel_contigs, model, reference, ambiguous_bases,
                 if not overlaps_intervals(ambiguous_bases[contig],i, i+window_size):
                     tensors = [reference[contig][i - window_size - 1: i + window_size] for
                                i in range(i, i + window_size)]
-                    pred = model.predict(tensors)
+                    pred = model.predict(tensors, verbose=1)
                     results.append([contig, i+1, i+1+window_size, np.sum(pred[:,0]), n_vcf_indels])
 
                 indel_index += n_vcf_indels
