@@ -16,6 +16,7 @@ from sklearn.preprocessing import LabelBinarizer
 from pprint import pprint
 from os import listdir, makedirs, path
 import pickle
+import itertools
 
 from Bio import Seq, SeqIO
 
@@ -66,8 +67,8 @@ def load_fasta_reference(in_path):
         start = timer()
         logger.info("Encoding chromosome {}".format(contig))
         seq_list = list(str(sequence.seq))
-        #one_hot = dna_encoder.transform(seq_list)
-        #reference[contig] = one_hot.astype(np.int8).todense()
+        one_hot = dna_encoder.transform(seq_list)
+        reference[contig] = one_hot.astype(np.int8).todense()
         ambiguous_bases[contig] = rle_encode_ambiguous(seq_list)
         logger.info("Chrom {} encoded in {}.".format(contig, timer() - start))
     return reference, ambiguous_bases
@@ -108,18 +109,19 @@ def main(args):
     else:
         reference, ambiguous_bases = load_bitpacked_reference(args.ref)
 
-    indels = read_vcf(args.vcf, args.max_training)
+    indels, indel_contigs = read_vcf(args.vcf, args.max_training)
 
-    logger.info("Loading training data")
-    training, labels, indel_indices = vcf_to_indel_tensors(indels, reference, ambiguous_bases, args.window_size, args.neg_train_window)
-    logger.info("Loaded training examples with dimensions {}, labels with dimensions: {} and indel indices with dimesions: {}.".format(str(training.shape), str(labels.shape), str(indel_indices.shape)))
+    if args.train_model or args.save_best_examples:
+        logger.info("Loading training data")
+        training, labels, indel_indices = vcf_to_indel_tensors(indels, reference, ambiguous_bases, args.window_size, args.neg_train_window)
+        logger.info("Loaded training examples with dimensions {}, labels with dimensions: {} and indel indices with dimesions: {}.".format(str(training.shape), str(labels.shape), str(indel_indices.shape)))
 
-    logger.info("Splitting training data into training and testing sets.")
-    train, test = split_data([training, labels, indel_indices], [0.8,0.2])
+        logger.info("Splitting training data into training and testing sets.")
+        train, test = split_data([training, labels, indel_indices], [0.8,0.2])
 
-    logger.info("Training shape: {}, labels shape: {}".format(train[0].shape, train[1].shape))
+        logger.info("Training shape: {}, labels shape: {}".format(train[0].shape, train[1].shape))
 
-    logger.info("Creating model")
+
     model = make_indel_model(args.window_size)
 
     if args.train_model:
@@ -130,12 +132,13 @@ def main(args):
 
         logger.info("Plotting metrics.")
         plot_metric_history(history, args.output + ".metrics_history.pdf", "Indel model")
+
+        logger.info("Evaluating model.")
+        eval_values = model.evaluate(test[0], test[1])
+        pprint(", ".join(["{}: {}".format(metric, value) for metric, value in zip(model.metrics_names, eval_values)]))
+
     else:
         model.load_weights(args.callback, by_name=True)
-
-    logger.info("Evaluating model.")
-    eval_values = model.evaluate(test[0], test[1])
-    pprint(", ".join(["{}: {}".format(metric,value) for metric, value in zip(model.metrics_names, eval_values)]))
 
     if args.save_best_examples:
         logger.info("Saving best scoring training examples")
@@ -148,27 +151,55 @@ def main(args):
             file.write("{}\t{}\t{}\t{}\t{}\t{:.3f}\t{}\n".format(seq[:30], seq[30], seq[31:], ref, alt, score, training_label))
         file.close()
 
+    predictions = {}
+    predictions_path = args.output + ".predictions/"
+    if args.compute_predictions:
+        if not path.exists(predictions_path):
+            makedirs(predictions_path)
+        #TODO: Right now only computes predictions for 10Mb from chrom 22 --replace with reference.keys() when ready
+        for contig in ["22"]:
+            results = apply_model(model, reference[contig][:10000000],args.window_size)
+            predictions[contig] = results
+            np.save(predictions_path + "{}.npy".format(contig), results)
+
+    if args.load_predictions:
+        for f in listdir(predictions_path):
+            if f.endswith(".npy"):
+                predictions[f[:-4]] = np.load(predictions_path + f)
+        logger.info("Loaded predictions from {}:\n{}".format(
+            predictions_path,
+            "\n".join(["{}: {}".format(c,len(b)) for c,b in predictions.iteritems()])))
+
+    if args.eval_predictions:
+        results = apply_model(indels, indel_contigs, model, reference, ambiguous_bases)
+        file = open(args.output + ".exp_obs_counts.tsv","w")
+        for res in results:
+            file.write("\t".join(res))
+        file.close()
+
+
 
 def read_vcf(vcf_path, max_training):
     logger.info("Loadind indels from VCF {}.".format(vcf_path))
     file = open(vcf_path, 'r')
     vcf_reader = vcf.Reader(file)
     indels = []
+    contigs = []
 
     # Get positive training examples
     start = timer()
-    n_indels = 0
     for variant in vcf_reader:
-        if max_training >= 0 and n_indels >= max_training:
+        if max_training >= 0 and len(indels) >= max_training:
             break
 
         if not variant.is_snp:
             indels.append(variant)
-            n_indels += 1
+            if not contigs or variant.CHROM != contigs[-1]:
+                contigs.append(variant.CHROM)
 
     logger.info("Loaded {} indels from VCF in {}.".format(len(indels), timer() - start))
     file.close()
-    return indels
+    return indels, contigs
 
 def vcf_to_indel_tensors(indels, reference, ambiguous_bases, window_size, neg_train_window, squash_multi_allelic = False):
     positive_training = []
@@ -428,21 +459,58 @@ def get_best_scoring_training_examples(model, training_data, n_best = 50):
     return positive_examples, negative_examples
 
 
-def apply_model(indels, model, reference, ambiguous_bases, window_size = 1000):
-    result = {}
-    for chrom, positions in reference.iteritems():
-        if not indels[chrom]:
-            logger.info("Skipping chromosome {} as no indels found in VCF.".format(chrom))
-        else:
-            chrom_size = reference[chrom].shape(0)
+def apply_model(model, reference_contig, window_size):
+    logger.info("Computing predictions for {} bases.".format(len(reference_contig)))
+    start = timer()
+    tensors = np.asarray([ reference_contig[i - window_size -1: i + window_size] for
+                i in range(window_size + 1, len(reference_contig) - window_size)])
+    predictions = model.predict(tensors)[:,0].astype(np.float16)
+    predictions = np.append(np.zeros(window_size + 1, dtype=np.float16), predictions)
+    predictions = np.append(predictions, np.zeros(window_size, dtype=np.float16))
+    logger.info("Computed {} predictions in {}.".format(len(predictions), timer() - start))
+    return predictions
+
+
+def eval_predictions(predictions, indels, reference, ambiguous_bases, bin_size = 10000):
+    logger.info("Evaluating predictions...")
+
+    logger.info("Evaluating predictions at ambiguous bases")
+    for contig, pred in predictions:
+        pass
+
+
+def apply_model_binned(indels, indel_contigs, model, reference, ambiguous_bases, window_size = 10000):
+
+    logger.info("Computing expected and observed number of indels with window size: {}.".format(window_size))
+
+    ref_only_contigs = [x for x in reference.keys() if x not in indel_contigs]
+    if ref_only_contigs:
+        logger.info("The following reference contigs will be skipped as no indels found in VCF: {}".format(", ".join(ref_only_contigs)))
+
+    results = []
+    indel_index = 0
+    for contig in indel_contigs:
+        if contig in reference:
+            chrom_size = reference[contig].shape[0]
             i = 0
-            #TODO: Skip N's and ambiguous bases
-            #Read from VCF
             while i < chrom_size - window_size:
-                if overlaps_intervals(ambiguous_bases,i, i+window_size):
-                    continue
-                pred = model.predict(positions[i:i+window_size])
+                n_vcf_indels = sum(1 for i in itertools.takewhile(lambda x: x.CHROM == contig and x.POS < i + window_size, # Strictly smaller since VCF is 1-based
+                                                              indels[indel_index:]))
+
+                if not overlaps_intervals(ambiguous_bases[contig],i, i+window_size):
+                    tensors = [reference[contig][i - window_size - 1: i + window_size] for
+                               i in range(i, i + window_size)]
+                    pred = model.predict(tensors)
+                    results.append([contig, i+1, i+1+window_size, np.sum(pred[:,0]), n_vcf_indels])
+
+                indel_index += n_vcf_indels
                 i+= window_size
+
+        else:
+            logger.warn("Skipping contig {}. Not found in the reference.".format(contig))
+            indel_index += sum(1 for i in itertools.takewhile(lambda x: x.CHROM == contig, indels[indel_index:]))
+
+    return results
 
 
 
@@ -465,6 +533,13 @@ if __name__ == '__main__':
     parser.add_argument('--callback', help='When specified, will initialize the model weights with the given callback.', required=False)
     parser.add_argument('--save_best_examples', help='When specified, saves the best training examples (for each class).',
                         action='store_true', required=False)
+    parser.add_argument('--compute_predictions', help='Computes predictions for every base in the genome and writes them to disk.',
+                        action='store_true', required=False)
+    parser.add_argument('--load_predictions', help='Loads predictions for every base in the genome from the directory specified.',
+                        required=False)
+    parser.add_argument('--eval_predictions', help='Evaluate predictions against indels.',
+                        action='store_true', required=False)
+
     args = parser.parse_args()
 
     if int(args.ref_fasta is not None) + int(args.ref is not None) != 1:
@@ -472,5 +547,8 @@ if __name__ == '__main__':
 
     if not args.train_model and not args.callback:
         sys.exit("Must specify --callback when not using --train_model.")
+
+    if args.compute_predictions and args.load_predictions:
+        sys.exit("Only one of --compute_predictions and --load_predictions can be specified.")
 
     main(args)
