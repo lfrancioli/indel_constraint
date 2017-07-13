@@ -1,30 +1,32 @@
-import os
 import sys
 import vcf
-import h5py
 import argparse
 import numpy as np
 import logging
 import random
-from collections import defaultdict
+from collections import OrderedDict
 import math
 import matplotlib
+import statsmodels.formula.api as smf
 matplotlib.use('agg')
 import matplotlib.pyplot as plt
+import seaborn as sns
 from timeit import default_timer as timer
 from sklearn.preprocessing import LabelBinarizer
+from sklearn.metrics import confusion_matrix
 from pprint import pprint
 from os import listdir, makedirs, path
 import pickle
 import itertools
+import pandas as pd
 
-from Bio import Seq, SeqIO
+from Bio import SeqIO
 
 from keras.optimizers import SGD, Adam
-from keras.models import Sequential, Model
+from keras.models import Model
 from keras.callbacks import ModelCheckpoint, EarlyStopping, TensorBoard
-from keras.layers import Input, Dense, Dropout, SpatialDropout2D, Flatten, Reshape, merge, SpatialDropout1D
-from keras.layers.convolutional import Conv1D, Convolution2D, MaxPooling1D, MaxPooling2D
+from keras.layers import Input, Dense, Dropout, Flatten, Reshape, merge, SpatialDropout1D
+from keras.layers.convolutional import Conv1D, MaxPooling1D
 
 logging.basicConfig(format="%(levelname)s (%(name)s %(lineno)s): %(message)s")
 logger = logging.getLogger("indel")
@@ -171,20 +173,18 @@ def main(args):
             "\n".join(["{}: {}".format(c,len(b)) for c,b in predictions.iteritems()])))
 
     if args.eval_predictions:
-        results = apply_model(indels, indel_contigs, model, reference, ambiguous_bases)
-        file = open(args.output + ".exp_obs_counts.tsv","w")
-        for res in results:
-            file.write("\t".join(res))
-        file.close()
-
+        logger.info("Evaluating predictions.")
+        results = eval_predictions(predictions, indels, indel_contigs, ambiguous_bases, args.eval_bin_size)
+        if results is not None:
+            plot_binned_eval(results, args.output + ".linreg_binned_{}.pdf".format(args.eval_bin_size))
 
 
 def read_vcf(vcf_path, max_training):
-    logger.info("Loadind indels from VCF {}.".format(vcf_path))
+    logger.info("Loading indels from VCF {}.".format(vcf_path))
     file = open(vcf_path, 'r')
     vcf_reader = vcf.Reader(file)
     indels = []
-    contigs = []
+    contigs = OrderedDict()
 
     # Get positive training examples
     start = timer()
@@ -193,9 +193,13 @@ def read_vcf(vcf_path, max_training):
             break
 
         if not variant.is_snp:
+            if not variant.CHROM in contigs:
+                if contigs:
+                    contigs[contigs.keys()[-1]].append(len(indels) -1)
+                contigs[variant.CHROM] = [len(indels)]
             indels.append(variant)
-            if not contigs or variant.CHROM != contigs[-1]:
-                contigs.append(variant.CHROM)
+
+    contigs[contigs.keys()[-1]].append(len(indels) - 1)
 
     logger.info("Loaded {} indels from VCF in {}.".format(len(indels), timer() - start))
     file.close()
@@ -424,6 +428,14 @@ def plot_metric_history(history, output, title):
     plt.savefig(output)
 
 
+def plot_binned_eval(results, output):
+    fit = smf.ols("n_vcf_indels ~ n_pred_indels", data=results).fit()
+    plot = sns.regplot('n_vcf_indels', 'n_pred_indels', data=results)
+    plot.set_title('regression p-value: {}'.format(fit.pvalues[1]))
+    plt.savefig(output)
+
+
+
 def get_callbacks(output_prefix, patience=2, batch_size=32):
     checkpointer = ModelCheckpoint(filepath=output_prefix + ".callbacks", verbose=1, save_best_only=True)
     earlystopper = EarlyStopping(monitor='val_loss', patience=patience, verbose=1)
@@ -471,12 +483,75 @@ def apply_model(model, reference_contig, window_size):
     return predictions
 
 
-def eval_predictions(predictions, indels, reference, ambiguous_bases, bin_size = 10000):
-    logger.info("Evaluating predictions...")
+def eval_predictions(predictions, indels, indel_contigs, ambiguous_bases, bin_size):
+
+    if not set(indel_contigs.keys()).intersection(set(predictions.keys())):
+        logger.error("No contig found in both predictions and indels VCF. Cannot evaluate predictions.")
+        return None
 
     logger.info("Evaluating predictions at ambiguous bases")
-    for contig, pred in predictions:
-        pass
+    n = [0,0]
+    for contig, contig_predictions in predictions.iteritems():
+        if contig in ambiguous_bases:
+            for interval in ambiguous_bases[contig]:
+                if interval[0] > len(contig_predictions): #Mostly for testing when not computing full chromosomes
+                    break
+                n[0] += np.count_nonzero(contig_predictions[interval[0]:interval[1]])
+                n[1] += len(contig_predictions[interval[0]:interval[1]])
+
+    logger.info("Found {}/{} ambiguous bases with a prediction > 0.0".format(*n))
+
+    logger.info("Computing confusion matrix")
+    true_positives = np.empty(0,dtype=np.int8)
+    binarized_predictions = np.empty(0,dtype=np.int8)
+
+    for contig, (start_index, end_index) in indel_contigs.iteritems():
+        if contig in predictions:
+            contig_tps = np.zeros(len(predictions[contig]), dtype=np.int8)
+            contig_tps[[x.POS - 1 for x in indels[start_index:end_index] if x.POS <= len(predictions[contig])]] = 1 #If stmt is for testing when not computing full chromosomes
+            true_positives = np.append(true_positives, contig_tps)
+
+            contig_binarized_predictions = np.zeros(len(predictions[contig]), dtype=np.int8)
+            contig_binarized_predictions[predictions[contig] > 0.5] = 1
+            binarized_predictions = np.append(binarized_predictions, contig_binarized_predictions)
+
+    pprint(
+        pd.DataFrame(confusion_matrix(true_positives, binarized_predictions),
+                     columns=['pred_neg','pred_indel'],
+                     index=['truth_neg','truth_indel'])
+           )
+
+    logger.info("Computing predictions / observation counts in bins of size {}".format(bin_size))
+
+    results = []
+    for contig, (start_index, end_index) in indel_contigs.iteritems():
+        if contig in predictions:
+            bins = [(i, i+bin_size) for i in range(0, len(predictions[contig]), bin_size)]
+            print(bins)
+            indel_index = start_index
+            for start_pos, end_pos in bins:
+                n_vcf_indels = sum(1 for x in
+                                   itertools.takewhile(lambda x: x.POS < end_pos, # Strictly smaller since VCF is 1-based
+                                                       indels[indel_index:end_index]))
+
+                n_pred_indels = np.sum(predictions[contig][start_pos:end_pos])
+                results.append((
+                    contig,
+                    start_pos + 1,
+                    end_pos,
+                    n_vcf_indels,
+                    n_pred_indels,
+                    contig in ambiguous_bases and overlaps_intervals(ambiguous_bases[contig], start_pos, end_pos)
+                ))
+                indel_index += n_vcf_indels
+
+    results = pd.DataFrame.from_records(results, columns=['chrom','start','end','n_vcf_indels','n_pred_indels','overlaps_ambiguous'])
+
+    pprint(results)
+
+    logger.info("Obs/Exp Pearson correlation: {}".format(results[[3, 4]].corr(method='pearson')['n_vcf_indels']['n_pred_indels']))
+
+    return results
 
 
 def apply_model_binned(indels, indel_contigs, model, reference, ambiguous_bases, window_size = 10000):
@@ -539,6 +614,9 @@ if __name__ == '__main__':
                         required=False)
     parser.add_argument('--eval_predictions', help='Evaluate predictions against indels.',
                         action='store_true', required=False)
+    parser.add_argument('--eval_bin_size',
+                        help='Size of the bins to compute obs and exp. Needs to be >0.',
+                        required=False, default=5000, type=int)
 
     args = parser.parse_args()
 
@@ -550,5 +628,8 @@ if __name__ == '__main__':
 
     if args.compute_predictions and args.load_predictions:
         sys.exit("Only one of --compute_predictions and --load_predictions can be specified.")
+
+    if args.eval_bin_size < 1:
+        sys.exit("--eval_bin_size value must be > 0.")
 
     main(args)
