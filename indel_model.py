@@ -45,6 +45,23 @@ def overlaps_intervals(intervals, start, stop):
         stop < intervals[interval_stop - 1][1] or intervals[interval_stop][0] == stop
     )
 
+def get_interval_overlaps(intervals, start, stop):
+    interval_start = max(0, np.searchsorted(intervals[:, 0], start) -1 )
+    interval_stop = np.searchsorted(intervals[:, 0], stop)
+
+    results = []
+    for interval_start, interval_stop in intervals[interval_start:interval_stop]:
+        if interval_start > start:
+            results.append((start, interval_start, False))
+        if interval_stop > start:
+            results.append((max(start, interval_start), min(interval_stop, stop), True))
+        start = interval_stop
+
+    if start < stop:
+        results.append((start, stop, False))
+
+    return results
+
 
 def in_intervals(intervals, value):
     interval_index = np.searchsorted(intervals[:, 0], value)
@@ -158,11 +175,19 @@ def main(args):
     if args.compute_predictions:
         if not path.exists(predictions_path):
             makedirs(predictions_path)
-        #TODO: Right now only computes predictions for 10Mb from chrom 22 --replace with reference.keys() when ready
-        for contig in ["22"]:
-            results = apply_model(model, reference[contig][:10000000],args.window_size)
-            predictions[contig] = results
-            np.save(predictions_path + "{}.npy".format(contig), results)
+
+        if args.predictions_interval:
+            pred_contig, pred_end = args.predictions_interval.split(":")
+        else:
+            pred_contig = None
+            pred_end = None
+
+        for contig in reference.keys():
+            if pred_contig is None or pred_contig == contig:
+                reference_contig = reference[contig] if pred_end is None else reference[contig][0:int(pred_end)]
+                results = apply_model(model, reference_contig, ambiguous_bases[contig], args.window_size)
+                predictions[contig] = results
+                np.save(predictions_path + "{}.npy".format(contig), results)
 
     if args.load_predictions:
         for f in listdir(predictions_path):
@@ -189,7 +214,7 @@ def read_vcf(vcf_path, max_training):
     # Get positive training examples
     start = timer()
     for variant in vcf_reader:
-        if max_training >= 0 and len(indels) >= max_training:
+        if max_training > 0 and len(indels) >= max_training:
             break
 
         if not variant.is_snp:
@@ -201,7 +226,9 @@ def read_vcf(vcf_path, max_training):
 
     contigs[contigs.keys()[-1]].append(len(indels) - 1)
 
-    logger.info("Loaded {} indels from VCF in {}.".format(len(indels), timer() - start))
+    logger.info("Loaded indels from VCF {} in {}:\n{}".format(vcf_path,
+                                                              timer() - start,
+                                                              "\n".join("{}: {}".format(contig, end-start+1) for contig, (start,end) in contigs.iteritems())))
     file.close()
     return indels, contigs
 
@@ -471,19 +498,25 @@ def get_best_scoring_training_examples(model, training_data, n_best = 50):
     return positive_examples, negative_examples
 
 
-def apply_model(model, reference_contig, window_size):
+def apply_model(model, reference_contig, ambiguous_bases_contig, window_size):
     logger.info("Computing predictions for {} bases.".format(len(reference_contig)))
     start = timer()
-    tensors = np.asarray([ reference_contig[i - window_size -1: i + window_size] for
-                i in range(window_size + 1, len(reference_contig) - window_size)])
-    predictions = model.predict(tensors, verbose=1)[:,0].astype(np.float16)
-    predictions = np.append(np.zeros(window_size + 1, dtype=np.float16), predictions)
+    intervals = get_interval_overlaps(ambiguous_bases_contig, window_size, len(reference_contig) - window_size)
+    predictions = np.zeros(window_size, dtype=np.float16)
+    for interval_start, interval_stop, overlaps in intervals:
+        if overlaps:
+            predictions = np.append(predictions, np.zeros(interval_stop - interval_start, dtype=np.float16))
+        else:
+            tensors = np.asarray([ reference_contig[i - window_size -1: i + window_size] for
+                        i in range(interval_start, interval_stop)]) #TODO: This will have N context around start/end of non-amibugous sequences -- OK?
+            predictions = np.append(predictions, model.predict(tensors, verbose=1)[:,0].astype(np.float16))
+
     predictions = np.append(predictions, np.zeros(window_size, dtype=np.float16))
     logger.info("Computed {} predictions in {}.".format(len(predictions), timer() - start))
     return predictions
 
 
-def eval_predictions(predictions, indels, indel_contigs, ambiguous_bases, bin_size):
+def eval_predictions(predictions, indels, indel_contigs, ambiguous_bases, bin_size, drop_bins_with_ambiguous=True):
 
     if not set(indel_contigs.keys()).intersection(set(predictions.keys())):
         logger.error("No contig found in both predictions and indels VCF. Cannot evaluate predictions.")
@@ -507,14 +540,21 @@ def eval_predictions(predictions, indels, indel_contigs, ambiguous_bases, bin_si
 
     for contig, (start_index, end_index) in indel_contigs.iteritems():
         if contig in predictions:
-            contig_tps = np.zeros(len(predictions[contig]), dtype=np.int8)
-            contig_tps[[x.POS - 1 for x in indels[start_index:end_index] if x.POS <= len(predictions[contig])]] = 1 #If stmt is for testing when not computing full chromosomes
-            true_positives = np.append(true_positives, contig_tps)
+            indel_index = start_index
+            contig_length = len(predictions[contig])
+            intervals = get_interval_overlaps(ambiguous_bases[contig], 0, contig_length) if contig in ambiguous_bases else [dict(start=0, end=contig_length, overlaps=False)]
 
-            contig_binarized_predictions = np.zeros(len(predictions[contig]), dtype=np.int8)
-            contig_binarized_predictions[predictions[contig] > 0.5] = 1
-            binarized_predictions = np.append(binarized_predictions, contig_binarized_predictions)
+            for interval_start, interval_stop, overlaps in intervals:
+                interval_indels = [x.POS - interval_start - 1 for x in indels[indel_index:end_index] if x.POS <= interval_stop]
+                if not overlaps:
+                    interval_tps = np.zeros(interval_stop - interval_start, dtype=np.int8)
+                    interval_tps[interval_indels] = 1 #If stmt is for testing when not computing full chromosomes
+                    true_positives = np.append(true_positives, interval_tps)
 
+                    interval_binarized_predictions = np.zeros(interval_stop - interval_start, dtype=np.int8)
+                    interval_binarized_predictions[predictions[contig][interval_start:interval_stop] > 0.5] = 1
+                    binarized_predictions = np.append(binarized_predictions, interval_binarized_predictions)
+                indel_index += len(interval_indels)
     pprint(
         pd.DataFrame(confusion_matrix(true_positives, binarized_predictions),
                      columns=['pred_neg','pred_indel'],
@@ -527,7 +567,6 @@ def eval_predictions(predictions, indels, indel_contigs, ambiguous_bases, bin_si
     for contig, (start_index, end_index) in indel_contigs.iteritems():
         if contig in predictions:
             bins = [(i, i+bin_size) for i in range(0, len(predictions[contig]), bin_size)]
-            print(bins)
             indel_index = start_index
             for start_pos, end_pos in bins:
                 n_vcf_indels = sum(1 for x in
@@ -547,46 +586,14 @@ def eval_predictions(predictions, indels, indel_contigs, ambiguous_bases, bin_si
 
     results = pd.DataFrame.from_records(results, columns=['chrom','start','end','n_vcf_indels','n_pred_indels','overlaps_ambiguous'])
 
+    if drop_bins_with_ambiguous:
+        results = results[results.overlaps_ambiguous == False]
+
     pprint(results)
 
     logger.info("Obs/Exp Pearson correlation: {}".format(results[[3, 4]].corr(method='pearson')['n_vcf_indels']['n_pred_indels']))
 
     return results
-
-
-def apply_model_binned(indels, indel_contigs, model, reference, ambiguous_bases, window_size = 10000):
-
-    logger.info("Computing expected and observed number of indels with window size: {}.".format(window_size))
-
-    ref_only_contigs = [x for x in reference.keys() if x not in indel_contigs]
-    if ref_only_contigs:
-        logger.info("The following reference contigs will be skipped as no indels found in VCF: {}".format(", ".join(ref_only_contigs)))
-
-    results = []
-    indel_index = 0
-    for contig in indel_contigs:
-        if contig in reference:
-            chrom_size = reference[contig].shape[0]
-            i = 0
-            while i < chrom_size - window_size:
-                n_vcf_indels = sum(1 for i in itertools.takewhile(lambda x: x.CHROM == contig and x.POS < i + window_size, # Strictly smaller since VCF is 1-based
-                                                              indels[indel_index:]))
-
-                if not overlaps_intervals(ambiguous_bases[contig],i, i+window_size):
-                    tensors = [reference[contig][i - window_size - 1: i + window_size] for
-                               i in range(i, i + window_size)]
-                    pred = model.predict(tensors, verbose=1)
-                    results.append([contig, i+1, i+1+window_size, np.sum(pred[:,0]), n_vcf_indels])
-
-                indel_index += n_vcf_indels
-                i+= window_size
-
-        else:
-            logger.warn("Skipping contig {}. Not found in the reference.".format(contig))
-            indel_index += sum(1 for i in itertools.takewhile(lambda x: x.CHROM == contig, indels[indel_index:]))
-
-    return results
-
 
 
 if __name__ == '__main__':
@@ -615,8 +622,11 @@ if __name__ == '__main__':
     parser.add_argument('--eval_predictions', help='Evaluate predictions against indels.',
                         action='store_true', required=False)
     parser.add_argument('--eval_bin_size',
-                        help='Size of the bins to compute obs and exp. Needs to be >0.',
+                        help='Size of the bins to compute obs and exp (default 5,000). Needs to be >0.',
                         required=False, default=5000, type=int)
+    parser.add_argument('--predictions_interval',
+                        help='Limit predictions to the start of a single contig, in the form contig:end.',
+                        required=False)
 
     args = parser.parse_args()
 
