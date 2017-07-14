@@ -132,7 +132,7 @@ def main(args):
 
     if args.train_model or args.save_best_examples:
         logger.info("Loading training data")
-        training, labels, indel_indices = vcf_to_indel_tensors(indels, reference, ambiguous_bases, args.window_size, args.neg_train_window)
+        training, labels, indel_indices = vcf_to_indel_tensors(indels, reference, ambiguous_bases, args.window_size, args.neg_train_window, args.neg_to_pos_training)
         logger.info("Loaded training examples with dimensions {}, labels with dimensions: {} and indel indices with dimesions: {}.".format(str(training.shape), str(labels.shape), str(indel_indices.shape)))
 
         logger.info("Splitting training data into training and testing sets.")
@@ -232,7 +232,7 @@ def read_vcf(vcf_path, max_training):
     file.close()
     return indels, contigs
 
-def vcf_to_indel_tensors(indels, reference, ambiguous_bases, window_size, neg_train_window, squash_multi_allelic = False):
+def vcf_to_indel_tensors(indels, reference, ambiguous_bases, window_size, neg_train_window, neg_to_pos_training, squash_multi_allelic = False):
     positive_training = []
     negative_training = []
     labels = np.empty((0,2),dtype=np.int8)
@@ -259,16 +259,17 @@ def vcf_to_indel_tensors(indels, reference, ambiguous_bases, window_size, neg_tr
                                                      ambiguous_bases[contig],
                                                      neg_train_window,
                                                      reference[contig],
-                                                     window_size
+                                                     window_size,
+                                                     neg_to_pos_training
                                                      ))
 
-            indel_indices.extend([-1]*len(positive_training_pos))
+            indel_indices.extend([-1]*len(positive_training_pos) * neg_to_pos_training)
             labels = np.append(
                 labels,
                 np.concatenate(
                 (
                     np.full((len(positive_training_pos), 2), np.array([1, 0])),  # positive labels
-                    np.full((len(positive_training_pos), 2), np.array([0, 1]))  # negative labels
+                    np.full((len(positive_training_pos) * neg_to_pos_training, 2), np.array([0, 1]))  # negative labels
                 ), axis=0),
                 axis=0
             )
@@ -292,27 +293,28 @@ def get_training_tensor(chrom, pos, reference, window_size, encoder):
     return encoder.transform(list(record))
 
 
-def get_negative_training_tensors(positions, ambiguous_bases, neg_train_window, reference, window_size, max_retry = 100):
+def get_negative_training_tensors(positions, ambiguous_bases, neg_train_window, reference, window_size, neg_to_pos_training, max_retry = 100):
     max_pos = len(reference) - window_size
     neg_positions = []
     if neg_train_window > 0:
         for pos in positions.keys():
-            neg_pos = random.randint(pos - neg_train_window, pos + neg_train_window)
-            i = 0
-            while (neg_pos in positions or in_intervals(ambiguous_bases, neg_pos) or neg_pos > max_pos or neg_pos < window_size) and i < max_retry:
+            for i in range(neg_to_pos_training):
                 neg_pos = random.randint(pos - neg_train_window, pos + neg_train_window)
-                i+=1
+                i = 0
+                while (neg_pos in positions or in_intervals(ambiguous_bases, neg_pos) or neg_pos > max_pos or neg_pos < window_size) and i < max_retry:
+                    neg_pos = random.randint(pos - neg_train_window, pos + neg_train_window)
+                    i+=1
 
-            if i == max_retry:
-                logger.warn("No suitable negative training position found for positive training example {}. Skipping.".format(pos))
-            else:
-                neg_positions.append(neg_pos)
+                if i == max_retry:
+                    logger.warn("No suitable negative training position found for positive training example {}. Skipping.".format(pos))
+                else:
+                    neg_positions.append(neg_pos)
     else:
         # Samples randomly on the chromosome. Note that this procedure can lead to duplicate positions
-        while len(neg_positions) < len(positions):
+        while len(neg_positions) < neg_to_pos_training * len(positions):
             new_neg_positions = [x for x in
                                  random.sample(xrange(window_size, max_pos),
-                                               len(positions) - len(neg_positions))
+                                               neg_to_pos_training * len(positions) - len(neg_positions))
                                  if x not in positions and not in_intervals(ambiguous_bases, x)]
             neg_positions.extend(new_neg_positions)
 
@@ -610,6 +612,9 @@ if __name__ == '__main__':
     parser.add_argument('--neg_train_window',
                         help='Size of the window to consider on each side of the indel to sample a negative training example (default 1000). If set to a value < 1 => select a random position on the same chromosome.',
                         required=False, default=1000, type=int)
+    parser.add_argument('--neg_to_pos_training',
+                        help='Number of negative training examples per positive training example (default 1).',
+                        required=False, default=1, type=int)
     parser.add_argument('--train_model', help='Trains a new model. Required if not using --callback.', required=False,
                         action='store_true')
     parser.add_argument('--callback', help='When specified, will initialize the model weights with the given callback.', required=False)
