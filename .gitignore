@@ -1,5 +1,8 @@
 .idea
 hail.log
-gnomad_genomes_chrom20_indels.vcf
-gnomad_chrom20_indels.metrics_history.jpg
-gnomad_chrom20_indels.callbacks
+*.vcf
+*.jpg
+*.pdf
+*.callbacks
+test*
+*.fasta

@@ -99,7 +99,9 @@ def write_bitpacked_reference(reference, ambiguous_bases, out_path):
         makedirs(out_path)
     for contig, sequence in reference.iteritems():
         np.save(out_path + "/{}.npy".format(contig), np.packbits(sequence))
-    pickle.dump(ambiguous_bases, open(out_path + "/ambiguous_bases.pickle", "w"))
+
+    with open(out_path + "/ambiguous_bases.pickle", "w") as file:
+        pickle.dump(ambiguous_bases, file)
 
 
 def load_bitpacked_reference(in_path):
@@ -111,7 +113,8 @@ def load_bitpacked_reference(in_path):
             packed = np.load(in_path + "/" + f)
             reference[f[:-4]] = np.unpackbits(packed).reshape(packed.shape[1]*2, 4)
 
-    ambiguous_bases = pickle.load(open(in_path + "/ambiguous_bases.pickle", "r"))
+    with open(in_path + "/ambiguous_bases.pickle", "r") as file:
+        ambiguous_bases = pickle.load(file)
 
     for contig in reference:
         if contig not in ambiguous_bases:
@@ -128,11 +131,17 @@ def main(args):
     else:
         reference, ambiguous_bases = load_bitpacked_reference(args.ref)
 
-    indels, indel_contigs = read_vcf(args.vcf, args.max_training)
+    if args.training_vcf is not None:
+        training_indels, training_indel_contigs = read_vcfs(args.training_vcf, args.max_training, args.pass_only)
+
+    if args.eval_indels is not None:
+        eval_indels, eval_indel_contigs = read_vcfs(args.eval_indels, args.max_training, args.pass_only)
+    elif args.training_vcf is not None:
+        eval_indels, eval_indel_contigs = training_indels, training_indel_contigs
 
     if args.train_model or args.save_best_examples:
         logger.info("Loading training data")
-        training, labels, indel_indices = vcf_to_indel_tensors(indels, reference, ambiguous_bases, args.window_size, args.neg_train_window, args.neg_to_pos_training)
+        training, labels, indel_indices = vcf_to_indel_tensors(training_indels, reference, ambiguous_bases, args.window_size, args.neg_train_window, args.neg_to_pos_training)
         logger.info("Loaded training examples with dimensions {}, labels with dimensions: {} and indel indices with dimesions: {}.".format(str(training.shape), str(labels.shape), str(indel_indices.shape)))
 
         logger.info("Splitting training data into training and testing sets.")
@@ -160,15 +169,14 @@ def main(args):
         model.load_weights(args.callback, by_name=True)
 
     if args.save_best_examples:
-        logger.info("Saving best scoring training examples")
+        logger.info("Saving best scoring training indel examples")
         positive_examples, negative_examples = get_best_scoring_training_examples(model, train)
-        file = open(args.output + ".best_training_examples.tsv",'w')
-        for seq, score, label, indel_index in positive_examples + negative_examples:
-            ref = indels[indel_index].REF if indel_index > -1 else seq[30]
-            alt = ",".join([str(a) for a in indels[indel_index].ALT]) if indel_index > -1 else "null"
-            training_label = "indel" if label[0] == 1 else "no_indel"
-            file.write("{}\t{}\t{}\t{}\t{}\t{:.3f}\t{}\n".format(seq[:30], seq[30], seq[31:], ref, alt, score, training_label))
-        file.close()
+        with open(args.output + ".best_training_examples.tsv",'w') as file:
+            for seq, score, label, indel_index in positive_examples + negative_examples:
+                ref = training_indels[indel_index].REF if indel_index > -1 else seq[30]
+                alt = ",".join([str(a) for a in training_indels[indel_index].ALT]) if indel_index > -1 else "null"
+                training_label = "indel" if label[0] == 1 else "no_indel"
+                file.write("{}\t{}\t{}\t{}\t{}\t{:.3f}\t{}\n".format(seq[:30], seq[30], seq[31:], ref, alt, score, training_label))
 
     predictions = {}
     predictions_path = args.output + ".predictions/"
@@ -199,37 +207,58 @@ def main(args):
 
     if args.eval_predictions:
         logger.info("Evaluating predictions.")
-        results = eval_predictions(predictions, indels, indel_contigs, ambiguous_bases, args.eval_bin_size)
+        results = eval_predictions(predictions, eval_indels, eval_indel_contigs, ambiguous_bases, args.eval_bin_size)
         if results is not None:
             plot_binned_eval(results, args.output + ".linreg_binned_{}.pdf".format(args.eval_bin_size))
 
 
-def read_vcf(vcf_path, max_training):
-    logger.info("Loading indels from VCF {}.".format(vcf_path))
-    file = open(vcf_path, 'r')
-    vcf_reader = vcf.Reader(file)
+def read_vcfs(vcf_paths, max_training, pass_only):
     indels = []
     contigs = OrderedDict()
 
-    # Get positive training examples
-    start = timer()
-    for variant in vcf_reader:
+    for vcf in vcf_paths:
+        vcf_indels, vcf_contigs = read_vcf(vcf, max_training - len(indels), pass_only)
+        next_indel_index = contigs[contigs.keys()[-1]][-1] + 1 if contigs else 0
+        for contig in vcf_contigs.keys():
+            if contig in contigs.keys():
+                sys.exit("FATAL: Contig {} found in multiple VCF files (last file: {}). Each contig has to be contained within a single VCF file.". format(contig, vcf))
+            contigs[contig] = [i + next_indel_index for i in vcf_contigs[contig]]
+
+        indels.extend(vcf_indels)
+
         if max_training > 0 and len(indels) >= max_training:
             break
 
-        if not variant.is_snp:
-            if not variant.CHROM in contigs:
-                if contigs:
-                    contigs[contigs.keys()[-1]].append(len(indels) -1)
-                contigs[variant.CHROM] = [len(indels)]
-            indels.append(variant)
+    return indels, contigs
 
-    contigs[contigs.keys()[-1]].append(len(indels) - 1)
 
-    logger.info("Loaded indels from VCF {} in {}:\n{}".format(vcf_path,
-                                                              timer() - start,
-                                                              "\n".join("{}: {}".format(contig, end-start+1) for contig, (start,end) in contigs.iteritems())))
-    file.close()
+def read_vcf(vcf_path, max_training, pass_only):
+    logger.info("Loading indels from VCF {}.".format(vcf_path))
+    indels = []
+    contigs = OrderedDict()
+
+    with open(vcf_path, 'r') as file:
+        vcf_reader = vcf.Reader(file)
+
+        # Get positive training examples
+        start = timer()
+        for variant in vcf_reader:
+            if max_training > 0 and len(indels) >= max_training:
+                break
+
+            if not variant.is_snp and (not pass_only or not variant.FILTER):
+                if not variant.CHROM in contigs:
+                    if contigs:
+                        contigs[contigs.keys()[-1]].append(len(indels) -1)
+                    contigs[variant.CHROM] = [len(indels)]
+                indels.append(variant)
+
+        contigs[contigs.keys()[-1]].append(len(indels) - 1)
+
+        logger.info("Loaded indels from VCF {} in {}:\n{}".format(vcf_path,
+                                                                  timer() - start,
+                                                                  "\n".join("{}: {}".format(contig, end-start+1) for contig, (start,end) in contigs.iteritems())))
+
     return indels, contigs
 
 def vcf_to_indel_tensors(indels, reference, ambiguous_bases, window_size, neg_train_window, neg_to_pos_training, squash_multi_allelic = False):
@@ -602,7 +631,8 @@ if __name__ == '__main__':
     parser = argparse.ArgumentParser()
     parser.add_argument('--ref', help='One-hot-encoded reference (required if not using --ref_fasta)', required=False)
     parser.add_argument('--ref_fasta', help='Reference fasta. If used, the reference will be one-hot-encoded and saved as a npy files. (required if not using --ref)', required=False)
-    parser.add_argument('--vcf', help='VCF containing indel training examples', required=True)
+    parser.add_argument('--training_vcf', help='VCF(s) containing indel training examples. Required to train a model.', required=False, nargs="+")
+    parser.add_argument('--eval_vcf', help='VCF(s) containing indel evaluation examples. If not specified, VCF used for training is used. Either --training_vcf or --eval_vcf is required for evaluation.', required=False, nargs="+")
     parser.add_argument('--output', help='Output prefix', required=True)
     parser.add_argument('--window_size', help='Size of the window to consider on each side of the indel (default 30).',
                         required=False, default=30, type=int)
@@ -615,6 +645,8 @@ if __name__ == '__main__':
     parser.add_argument('--neg_to_pos_training',
                         help='Number of negative training examples per positive training example (default 1).',
                         required=False, default=1, type=int)
+    parser.add_argument('--pass_only', help='Use PASS indels only.',
+                        action='store_true', required=False)
     parser.add_argument('--train_model', help='Trains a new model. Required if not using --callback.', required=False,
                         action='store_true')
     parser.add_argument('--callback', help='When specified, will initialize the model weights with the given callback.', required=False)
@@ -643,6 +675,12 @@ if __name__ == '__main__':
 
     if args.compute_predictions and args.load_predictions:
         sys.exit("Only one of --compute_predictions and --load_predictions can be specified.")
+
+    if (args.train_model or args.save_best_examples) and (args.training_vcf is None):
+        sys.exit("--training_vcf needs to be specified to train a model (--train_model) or save best training examples (--save_best_examples).")
+
+    if args.eval_predictions and args.training_vcf is None and args.eval_vcf is None:
+        sys.exit("At least one of --training_vcf or --eval_vcf needed for evaluation of predictions (--eval_predictions).")
 
     if args.eval_bin_size < 1:
         sys.exit("--eval_bin_size value must be > 0.")
