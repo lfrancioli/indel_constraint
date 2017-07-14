@@ -508,7 +508,7 @@ def apply_model(model, reference_contig, ambiguous_bases_contig, window_size):
             predictions = np.append(predictions, np.zeros(interval_stop - interval_start, dtype=np.float16))
         else:
             tensors = np.asarray([ reference_contig[i - window_size -1: i + window_size] for
-                        i in range(interval_start, interval_stop)]) #TODO: This will have N context around start/end of non-amibugous sequences -- OK?
+                        i in range(interval_start, interval_stop)]) #This will have N context around start/end of non-amibugous sequences -- OK?
             predictions = np.append(predictions, model.predict(tensors, verbose=1)[:,0].astype(np.float16))
 
     predictions = np.append(predictions, np.zeros(window_size, dtype=np.float16))
@@ -591,7 +591,7 @@ def eval_predictions(predictions, indels, indel_contigs, ambiguous_bases, bin_si
 
     pprint(results)
 
-    logger.info("Obs/Exp Pearson correlation: {}".format(results[[3, 4]].corr(method='pearson')['n_vcf_indels']['n_pred_indels']))
+    logger.info("Obs/Exp Pearson correlation: {}".format(results[['n_vcf_indels','n_pred_indels']].corr(method='pearson')['n_vcf_indels']['n_pred_indels']))
 
     return results
 
