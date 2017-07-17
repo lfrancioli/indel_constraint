@@ -28,6 +28,8 @@ def main(args):
     p_per_base = args.n_points_for_norm / total_length
     norm = np.linalg.norm(np.asarray([ np.random.choice(x, int(p_per_base * len(x))) for x in contigs.values() ]).flatten())
 
+    print "Norm: {}".format(norm)
+
     print "Writing coverage"
     if not path.exists(args.output):
         makedirs(args.output)
@@ -40,7 +42,7 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--input", help="Coverage file(s).", nargs='+')
     parser.add_argument("--output", help="Coverage output path.")
-    parser.add_argument("--n_points_for_norm", help="Coverage output path.", type=int, default=50000000)
+    parser.add_argument("--n_points_for_norm", help="Number of coverage points to use for normalization.", type=int, default=50000000)
 
     main(parser.parse_args())
 
