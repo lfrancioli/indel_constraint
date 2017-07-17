@@ -149,7 +149,7 @@ def main(args):
         training_indels, training_indel_contigs = read_vcfs(args.train_vcf, args.max_training, args.pass_only)
 
     if args.eval_vcf is not None:
-        eval_indels, eval_indel_contigs = read_vcfs(args.eval_indels, args.max_training, args.pass_only)
+        eval_indels, eval_indel_contigs = read_vcfs(args.eval_vcf, args.max_training, args.pass_only)
     elif args.train_vcf is not None:
         eval_indels, eval_indel_contigs = training_indels, training_indel_contigs
 
