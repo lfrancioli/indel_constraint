@@ -543,7 +543,7 @@ def tensor_to_str(tensor):
 
 def get_best_scoring_training_examples(model, training_data, n_best = 50):
 
-    probs = model.predict(training_data[0], verbose=1)[:,0]
+    probs = model.predict(training_data[0:2], verbose=1)[:,0]
 
     # Best scoring positive training examples
     best_scoring_indices = np.argpartition(probs,-n_best)[-n_best:]
