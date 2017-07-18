@@ -199,11 +199,11 @@ def main(args):
         logger.info("Saving best scoring training indel examples. Learning phase =  {}".format(K.learning_phase()))
         positive_examples, negative_examples = get_best_scoring_training_examples(model, train)
         with open(args.output + ".best_training_examples.tsv",'w') as file:
-            for seq, coverage, score, label, indel_index in positive_examples + negative_examples:
+            for seq, cov, score, label, indel_index in positive_examples + negative_examples:
                 ref = training_indels[indel_index].REF if indel_index > -1 else seq[30]
                 alt = ",".join([str(a) for a in training_indels[indel_index].ALT]) if indel_index > -1 else "null"
                 training_label = "indel" if label[0] == 1 else "no_indel"
-                file.write("{}\t{}\t{}\t{}\t{}\t{}\t{:.3f}\t{}\n".format(seq[:30], seq[30], seq[31:], ref, alt, coverage, score, training_label))
+                file.write("{}\t{}\t{}\t{}\t{}\t{}\t{:.3f}\t{}\n".format(seq[:30], seq[30], seq[31:], ref, alt, cov, score, training_label))
 
     predictions = {}
     predictions_path = args.output + ".predictions/"
