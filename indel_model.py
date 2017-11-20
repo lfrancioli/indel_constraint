@@ -83,7 +83,7 @@ def load_fasta_reference(in_path):
     logger.info("Reading fasta file {}".format(in_path))
     start = timer()
     fasta = SeqIO.to_dict(SeqIO.parse(in_path, "fasta"))
-    logger.info("Reading fasata file loaded in {}.".format(timer() - start))
+    logger.info("Fasta file loaded in {}.".format(timer() - start))
     for contig, sequence in fasta.iteritems():
         start = timer()
         logger.info("Encoding chromosome {}".format(contig))
@@ -218,6 +218,7 @@ def main(args):
             pred_end = None
 
         for contig in reference.keys():
+            #TODO add warning if desired contig is never found
             if pred_contig is None or pred_contig == contig:
                 reference_contig = reference[contig] if pred_end is None else reference[contig][0:int(pred_end)]
                 results = apply_model(model, reference_contig, ambiguous_bases[contig], coverage[contig], args.window_size)
