@@ -25,7 +25,7 @@ from Bio import SeqIO
 from keras.optimizers import SGD, Adam
 from keras.models import Model
 from keras.callbacks import ModelCheckpoint, EarlyStopping, TensorBoard
-from keras.layers import Input, Dense, Dropout, Flatten, Reshape, merge, SpatialDropout1D, concatenate
+from keras.layers import Input, Dense, Dropout, Flatten, Reshape, merge, SpatialDropout1D, concatenate, BatchNormalization
 from keras import backend as K
 from keras.layers.convolutional import Conv1D, MaxPooling1D
 import tensorflow as tf
@@ -137,6 +137,57 @@ def load_coverage(in_path):
     logger.info("Coverage files loaded in {}".format(timer() - start))
     return coverage
 
+def get_training_examples(training_indels, #TODO Use a config object here
+                          reference,
+                          ambiguous_bases,
+                          window_size,
+                          neg_train_window,
+                          neg_to_pos_training,
+                          coverage,
+                          coverage_window_size):
+    logger.info("Creating training tensors")
+    training_bases, training_coverage, labels, indel_indices = vcf_to_indel_tensors(training_indels,
+                                                                                    reference,
+                                                                                    ambiguous_bases,
+                                                                                    window_size,
+                                                                                    neg_train_window,
+                                                                                    neg_to_pos_training,
+                                                                                    coverage,
+                                                                                    coverage_window_size)
+
+    logger.info(
+        "Training tensors created with dimensions:\ntraining_bases: {}\ntraining coverage:{}\nlabels: {}\nindel indices: {}.".format(
+            training_bases.shape, training_coverage.shape, labels.shape, indel_indices.shape))
+
+    logger.info("Splitting training data into training and testing sets.")
+    data_labels = ["Training bases", "labels", "indices"]
+    data_for_splitting = [training_bases, labels, indel_indices]
+    if args.coverage:
+        data_labels.insert(len(data_labels) - 2, "coverage")
+        data_for_splitting.insert(len(data_for_splitting) - 2, training_coverage)
+    train, test = split_data(data_for_splitting, [0.8, 0.2])
+
+    logger.info(",".join("{}: {}".format(label, x.shape) for (label, x) in zip(data_labels, train)))
+
+    return train, test
+
+
+def train_model(model, train, test, output, batch_size=64):
+    K.set_learning_phase(1)
+    logger.info("Training model. Learning phase =  {}".format(K.learning_phase()))
+    if args.callback:
+        model.load_weights(args.callback, by_name=True)
+    history = model.fit(train[:-2], train[-2], batch_size=batch_size, validation_split=0.2, shuffle=True, epochs=10,
+                        callbacks=get_callbacks(output + ".callbacks", batch_size=batch_size))
+
+    logger.info("Plotting metrics.")
+    plot_metric_history(history, output + ".metrics_history.pdf", "Indel model")
+
+    K.set_learning_phase(0)
+    logger.info("Evaluating model. Learning phase =  {}".format(K.learning_phase()))
+    eval_values = model.evaluate(test[:-2], test[-2])
+    pprint(", ".join(["{}: {}".format(metric, value) for metric, value in zip(model.metrics_names, eval_values)]))
+
 
 def main(args):
     if args.ref_fasta:
@@ -153,57 +204,77 @@ def main(args):
     elif args.train_vcf is not None:
         eval_indels, eval_indel_contigs = training_indels, training_indel_contigs
 
-    if args.train_model or args.save_best_examples or args.compute_predictions:
+    if args.coverage and (args.train_model or args.save_best_examples or args.compute_predictions or args.tune_hyperparams): #TODO: really need all those ORs ?
         coverage = load_coverage(args.coverage)
 
+    if args.tune_hyperparams:
+        hyper_params = get_hyperparams()
+
+        logger.info("Training models for {} parameter combinations".format(len(hyper_params)))
+
+        for i, (window_size, conv1d_params) in enumerate(hyper_params):
+            logger.info("Training model with window size {} and 1D convolutions:\n{}".format(
+                window_size,
+                "\n".join([
+                    '{} filters of size {},'.format(filter_size, n_filters) for filter_size, n_filters in conv1d_params
+                ])
+            ))
+            train, test = get_training_examples(training_indels,  # TODO Use a config object here
+                                                reference,
+                                                ambiguous_bases,
+                                                window_size,
+                                                args.neg_train_window,
+                                                args.neg_to_pos_training,
+                                                coverage=None if not args.coverage else coverage,
+                                                coverage_window_size=args.coverage_window_size)
+            K.set_learning_phase(1)
+            model = make_indel_model(conv1d_params, window_size,
+                                     coverage_window_size=args.coverage_window_size if args.coverage else None)
+            train_model(model, train, test, args.output + "{}_{}".format(window_size, i))
+
+        sys.exit("done!") #TOOD: be graceful about it
+
+
     if args.train_model or args.save_best_examples:
-        logger.info("Creating training tensors")
-        training_bases, training_coverage, labels, indel_indices = vcf_to_indel_tensors(training_indels,
-                                                               reference,
-                                                               ambiguous_bases,
-                                                               coverage,
-                                                               args.window_size,
-                                                               args.neg_train_window,
-                                                               args.neg_to_pos_training)
-        logger.info("Training tensors created with dimensions:\ntraining_bases: {}\ntraining coverage:{}\nlabels: {}\nindel indices: {}.".format(training_bases.shape, training_coverage.shape, labels.shape, indel_indices.shape))
-
-        logger.info("Splitting training data into training and testing sets.")
-        train, test = split_data([training_bases, training_coverage, labels, indel_indices], [0.8,0.2])
-
-        logger.info("Training bases shape: {}, training coverage shape: {}, labels shape: {}".format(train[0].shape, train[1].shape, train[2].shape))
+        train, test = get_training_examples(training_indels,  # TODO Use a config object here
+                              reference,
+                              ambiguous_bases,
+                              args.window_size,
+                              args.neg_train_window,
+                              args.neg_to_pos_training,
+                              coverage=None if not args.coverage else coverage,
+                              coverage_window_size=args.coverage_window_size)
 
     K.set_learning_phase(1)
-    model = make_indel_model(args.window_size)
+    conv1d_params = [(200,12),(200,12),(100,12)]
+    model = make_indel_model(conv1d_params, args.window_size, coverage_window_size = args.coverage_window_size if args.coverage else None)
 
     if args.train_model:
-        K.set_learning_phase(1)
-        logger.info("Training model. Learning phase =  {}".format(K.learning_phase()))
-        if args.callback:
-            model.load_weights(args.callback, by_name=True)
-        history = model.fit([train[0], train[1]], train[2], batch_size=32, validation_split=0.2, shuffle=True, epochs=10, callbacks=get_callbacks(args.output+".callbacks"))
-
-        logger.info("Plotting metrics.")
-        plot_metric_history(history, args.output + ".metrics_history.pdf", "Indel model")
-
-        K.set_learning_phase(0)
-        logger.info("Evaluating model. Learning phase =  {}".format(K.learning_phase()))
-        eval_values = model.evaluate([test[0], test[1]], test[2])
-        pprint(", ".join(["{}: {}".format(metric, value) for metric, value in zip(model.metrics_names, eval_values)]))
-
+        train_model(model, train, test, args.output)
     else:
         model.load_weights(args.callback, by_name=True)
-
         K.set_learning_phase(0)
 
     if args.save_best_examples:
         logger.info("Saving best scoring training indel examples. Learning phase =  {}".format(K.learning_phase()))
         positive_examples, negative_examples = get_best_scoring_training_examples(model, train)
         with open(args.output + ".best_training_examples.tsv",'w') as file:
-            for seq, cov, score, label, indel_index in positive_examples + negative_examples:
+            for example in positive_examples + negative_examples:
+                seq = example[0]
+                score = '{:.3f}'.format(example[-3])
+                label = example[-2]
+                indel_index = example[-1]
                 ref = training_indels[indel_index].REF if indel_index > -1 else seq[30]
                 alt = ",".join([str(a) for a in training_indels[indel_index].ALT]) if indel_index > -1 else "null"
                 training_label = "indel" if label[0] == 1 else "no_indel"
-                file.write("{}\t{}\t{}\t{}\t{}\t{}\t{:.3f}\t{}\n".format(seq[:30], seq[30], seq[31:], ref, alt, cov, score, training_label))
+                file.write("\t".join([training_label,
+                                      score,
+                                      seq[:args.window_size],
+                                      seq[args.window_size],
+                                      seq[args.window_size + 1:],
+                                      ref,
+                                      alt] +
+                                     example[1:-3]))
 
     predictions = {}
     predictions_path = args.output + ".predictions/"
@@ -289,7 +360,7 @@ def read_vcf(vcf_path, max_training, pass_only):
 
     return indels, contigs
 
-def vcf_to_indel_tensors(indels, reference, ambiguous_bases, coverage, window_size, neg_train_window, neg_to_pos_training, squash_multi_allelic = False):
+def vcf_to_indel_tensors(indels, reference, ambiguous_bases, window_size, neg_train_window, neg_to_pos_training, coverage=None, coverage_window_size=None, squash_multi_allelic = False):
     positive_training_bases = []
     negative_training_bases = []
     positive_training_coverage = []
@@ -306,7 +377,8 @@ def vcf_to_indel_tensors(indels, reference, ambiguous_bases, coverage, window_si
         if not variant.is_snp and not (squash_multi_allelic and variant.POS in positive_training_pos):
             pos = variant.POS
             positive_training_bases.append(reference[contig][pos - window_size -1: pos + window_size])
-            positive_training_coverage.append(coverage[contig][pos - window_size -1: pos + window_size])
+            if coverage is not None:
+                positive_training_coverage.append(coverage[contig][pos - coverage_window_size -1: pos + coverage_window_size])
             indel_indices.append(i)
             while pos in positive_training_pos: # A bit of a trick for multi-allelic indels, but should be fine
                 pos+=1
@@ -323,8 +395,9 @@ def vcf_to_indel_tensors(indels, reference, ambiguous_bases, coverage, window_si
                                                                            neg_to_pos_training
                                                                            )
             negative_training_bases.extend([reference[contig][neg_pos - window_size -1: neg_pos + window_size] for neg_pos in neg_positions])
-            negative_training_coverage.extend(
-                [coverage[contig][neg_pos - window_size - 1: neg_pos + window_size] for neg_pos in neg_positions])
+            if coverage is not None:
+                negative_training_coverage.extend(
+                    [coverage[contig][neg_pos - coverage_window_size - 1: neg_pos + coverage_window_size] for neg_pos in neg_positions])
 
             indel_indices.extend([-1]*len(positive_training_pos) * neg_to_pos_training)
             labels = np.append(
@@ -383,24 +456,47 @@ def get_negative_training_positions(positions, ambiguous_bases, max_pos, neg_tra
     return neg_positions
 
 
-def make_indel_model(window_size):
+def get_hyperparams():
+    return [
+        (30, [(500, 16), (500, 8), (200, 8)]),
+        #(30,[(500,8),(500,8),(200,8), (200, 8)]), ## seemed pointless for some reason
+        (100, [(500,8),(500,8),(200,8)]),
+        (100, [(500, 16), (500, 8), (200, 8)]),
+        (100, [(500, 8), (500, 8), (200, 8), (200, 8)]),
+        (500, [(500, 8), (500, 8), (200, 8)]),
+        (500, [(500, 8), (500, 8), (200, 8), (200, 8)]),
+        (1000, [(500, 8), (500, 8), (200, 8)]),
+        (1000, [(500, 8), (500, 8), (200, 8), (200, 8)]),
+        (5000, [(500, 8), (500, 8), (200, 8)]),
+        (5000, [(500, 8), (500, 8), (200, 8), (200, 8)])
+    ]
+
+
+def make_indel_model(conv1d_params, window_size, coverage_window_size=None):
     indel = Input(shape=(2 * window_size + 1, len(BASES)), name="indel")
-    coverage = Input(shape=(2 * window_size + 1, 1), name="coverage")
-    x = Conv1D(filters=200, kernel_size=12, activation="relu", kernel_initializer='glorot_normal')(indel)
-    x = SpatialDropout1D(0.2)(x)
-    x = Conv1D(filters=200, kernel_size=12, activation="relu", kernel_initializer='glorot_normal')(x)
-    x = Dropout(0.2)(x)
-    x = Conv1D(filters=100, kernel_size=12, activation="relu", kernel_initializer='glorot_normal')(x)
-    x = Dropout(0.2)(x)
+    inputs = [indel]
+    x = indel
+    for n_filters, k_size in conv1d_params:
+        x = Conv1D(filters=n_filters, kernel_size=k_size, activation="relu", kernel_initializer='glorot_normal')(x)
+        x = Dropout(0.2)(x)
     x = Flatten()(x)
-    y = Conv1D(filters=50, kernel_size=12, activation="relu", kernel_initializer='glorot_normal')(coverage)
-    y = SpatialDropout1D(0.2)(y)
-    y = Flatten()(y)
-    x = concatenate([x, y])
+
+    if coverage_window_size is not None:
+        coverage = Input(shape=(2 * coverage_window_size + 1, 1), name="coverage")
+        if coverage_window_size > 0:
+            y = Conv1D(filters=50, kernel_size=12, activation="relu", kernel_initializer='glorot_normal')(coverage)
+            y = SpatialDropout1D(0.2)(y)
+            y = Flatten()(y)
+        else:
+            y = Flatten()(coverage)
+            y = Dense(units=4)(y)
+        inputs.append(coverage)
+        x = concatenate([x, y])
+
     x = Dense(units=64, kernel_initializer='normal', activation='relu')(x)
     prob_output = Dense(units=2, kernel_initializer='normal', activation='softmax')(x)
 
-    model = Model(inputs=[indel, coverage], outputs=[prob_output])
+    model = Model(inputs=inputs, outputs=[prob_output])
 
     sgd = SGD(lr=0.001, decay=1e-6, momentum=0.9, nesterov=True, clipnorm=0.5)
     adamo = Adam(lr=0.001, beta_1=0.9, beta_2=0.999, epsilon=1e-08, clipnorm=1.)
@@ -531,7 +627,6 @@ def plot_binned_eval(results, output):
     plt.savefig(output)
 
 
-
 def get_callbacks(output_prefix, patience=2, batch_size=32):
     checkpointer = ModelCheckpoint(filepath=output_prefix + ".callbacks", verbose=1, save_best_only=True)
     earlystopper = EarlyStopping(monitor='val_loss', patience=patience, verbose=1)
@@ -545,47 +640,61 @@ def tensor_to_str(tensor):
 
 def get_best_scoring_training_examples(model, training_data, n_best = 50):
 
-    probs = model.predict(training_data[0:2], verbose=1)[:,0]
+    def get_examples(training_data, best_scoring_indices):
+        examples = [
+            [tensor_to_str(t) for t in training_data[0][best_scoring_indices]],
+            probs[best_scoring_indices].tolist(),
+            training_data[-2][best_scoring_indices],
+            training_data[-1][best_scoring_indices]
+        ]
+        for i in range(1, len(training_data) - 3):
+            examples.insert(len(training_data) - 3, [np.mean(x) for x in training_data[i][best_scoring_indices]])
+
+        return [list(x) for x in zip(*examples)]
+
+    probs = model.predict(training_data[:-2], verbose=1)[:, 0]
 
     # Best scoring positive training examples
-    best_scoring_indices = np.argpartition(probs,-n_best)[-n_best:]
-    positive_examples = zip(
-        [tensor_to_str(t) for t in training_data[0][best_scoring_indices]],
-        [np.mean(x) for x in training_data[1][best_scoring_indices]],
-        probs[best_scoring_indices].tolist(),
-        training_data[2][best_scoring_indices],
-        training_data[3][best_scoring_indices])
+    best_scoring_indices = np.argpartition(probs, -n_best)[-n_best:]
+    positive_examples = get_examples(training_data, best_scoring_indices)
 
     # Best scoring negative training examples
-    best_scoring_indices = np.argpartition(probs,n_best)[:n_best]
-    negative_examples = zip(
-        [tensor_to_str(t) for t in training_data[0][best_scoring_indices]],
-        [np.mean(x) for x in training_data[1][best_scoring_indices]],
-        probs[best_scoring_indices].tolist(),
-        training_data[2][best_scoring_indices],
-        training_data[3][best_scoring_indices]
-    )
+    best_scoring_indices = np.argpartition(probs, n_best)[:n_best]
+    negative_examples = get_examples(training_data, best_scoring_indices)
 
     return positive_examples, negative_examples
 
 
-def apply_model(model, reference_contig, ambiguous_bases_contig, coverage_contig, window_size):
-    logger.info("Computing predictions for {} bases.".format(len(reference_contig)))
+def apply_model(model, features, window_sizes, ambiguous_bases_contig):
+    """
+    Applies the model using the given features and window sizes. Right now, features[0] should be the reference bases.
+
+    :param model:
+    :param features:
+    :param window_sizes:
+    :param ambiguous_bases_contig:
+    :return:
+    """
+    logger.info("Computing predictions for {} bases.".format(len(features[0])))
+    if len(features) != len(window_sizes):
+        sys.exit("Cannot compute predictions with features and window sizes length not matching")
+
     start = timer()
-    intervals = get_interval_overlaps(ambiguous_bases_contig, window_size, len(reference_contig) - window_size)
-    predictions = np.zeros(window_size, dtype=np.float16)
+    intervals = get_interval_overlaps(ambiguous_bases_contig, max(window_sizes), len(features[0]) - max(window_sizes))
+    predictions = np.zeros(max(window_sizes), dtype=np.float16)
+    features_windows = zip(features, window_sizes)
     for interval_start, interval_stop, overlaps in intervals:
         if overlaps:
             predictions = np.append(predictions, np.zeros(interval_stop - interval_start, dtype=np.float16))
         else:
-            tensors_bases = np.asarray([ reference_contig[i - window_size -1: i + window_size] for
-                        i in range(interval_start, interval_stop)]) #This will have N context around start/end of non-amibugous sequences -- OK?
-            tensors_coverage = np.asarray([coverage_contig[i - window_size - 1: i + window_size] for
-                                        i in range(interval_start,
-                                                   interval_stop)])  # This will have N context around start/end of non-amibugous sequences -- OK?
-            predictions = np.append(predictions, model.predict([tensors_bases, tensors_coverage], verbose=1)[:,0].astype(np.float16))
+            tensors = [
+                np.asarray([feature[i - window_size - 1: i + window_size] for
+                            i in range(interval_start, interval_stop)]) # This will have N context around start/end of non-amibugous sequences -- OK?
+                for (feature, window_size) in features_windows
+            ]
+            predictions = np.append(predictions, model.predict(tensors, verbose=1)[:,0].astype(np.float16))
 
-    predictions = np.append(predictions, np.zeros(window_size, dtype=np.float16))
+    predictions = np.append(predictions, np.zeros(max(window_sizes), dtype=np.float16))
     logger.info("Computed {} predictions in {}.".format(len(predictions), timer() - start))
     return predictions
 
@@ -708,20 +817,23 @@ if __name__ == '__main__':
     parser.add_argument('--predictions_interval',
                         help='Limit predictions to the start of a single contig, in the form contig:end.',
                         required=False)
+    parser.add_argument('--coverage_window_size', help='Size of the window to consider on each side of the indel for the coverage track (default 30). If set to 0, then no convolution is run.',
+                        required=False, default=30, type=int)
+    parser.add_argument('--tune_hyperparams', help='tune hyperparameters hardcoded for now...', action='store_true')
 
     args = parser.parse_args()
 
     if int(args.ref_fasta is not None) + int(args.ref is not None) != 1:
         sys.exit("One and only one of --ref_fasta or --ref is required.")
 
-    if not args.train_model and not args.callback:
-        sys.exit("Must specify --callback when not using --train_model.")
+    if not args.train_model and not args.callback and not args.tune_hyperparams:
+        sys.exit("One of --callback, --tune_hyperparams or --train_model is required.")
 
     if args.compute_predictions and args.load_predictions:
         sys.exit("Only one of --compute_predictions and --load_predictions can be specified.")
 
-    if (args.train_model or args.save_best_examples) and (args.train_vcf is None):
-        sys.exit("--train_vcf needs to be specified to train a model (--train_model) or save best training examples (--save_best_examples).")
+    if (args.train_model or args.save_best_examples or args.tune_hyperparams) and (args.train_vcf is None):
+        sys.exit("--train_vcf needs to be specified to train a model (--train_model, --tune_hyperparams) or save best training examples (--save_best_examples).")
 
     if args.eval_predictions and args.train_vcf is None and args.eval_vcf is None:
         sys.exit("At least one of --train_vcf or --eval_vcf needed for evaluation of predictions (--eval_predictions).")
