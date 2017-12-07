@@ -230,6 +230,7 @@ def main(args):
                                                 coverage_window_size=args.coverage_window_size)
             K.set_learning_phase(1)
             model = make_indel_model(conv1d_params, window_size,
+                                     n_gpus=args.gpus,
                                      coverage_window_size=args.coverage_window_size if args.coverage else None)
             train_model(model, train, test, args.output + "{}_{}".format(window_size, i), batch_size=64*args.gpus)
 
