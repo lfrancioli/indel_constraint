@@ -27,6 +27,7 @@ from keras.models import Model
 from keras.callbacks import ModelCheckpoint, EarlyStopping, TensorBoard
 from keras.layers import Input, Dense, Dropout, Flatten, Reshape, merge, SpatialDropout1D, concatenate, BatchNormalization
 from keras import backend as K
+from keras.utils.training_utils import multi_gpu_model
 from keras.layers.convolutional import Conv1D, MaxPooling1D
 import tensorflow as tf
 
@@ -230,7 +231,7 @@ def main(args):
             K.set_learning_phase(1)
             model = make_indel_model(conv1d_params, window_size,
                                      coverage_window_size=args.coverage_window_size if args.coverage else None)
-            train_model(model, train, test, args.output + "{}_{}".format(window_size, i))
+            train_model(model, train, test, args.output + "{}_{}".format(window_size, i), batch_size=64*args.gpus)
 
         sys.exit("done!") #TOOD: be graceful about it
 
@@ -247,10 +248,13 @@ def main(args):
 
     K.set_learning_phase(1)
     conv1d_params = [(200,12),(200,12),(100,12)]
-    model = make_indel_model(conv1d_params, args.window_size, coverage_window_size = args.coverage_window_size if args.coverage else None)
+    model = make_indel_model(conv1d_params,
+                             args.window_size,
+                             n_gpus=args.gpus,
+                             coverage_window_size = args.coverage_window_size if args.coverage else None)
 
     if args.train_model:
-        train_model(model, train, test, args.output)
+        train_model(model, train, test, args.output, batch_size=64*args.gpus)
     else:
         model.load_weights(args.callback, by_name=True)
         K.set_learning_phase(0)
@@ -472,7 +476,7 @@ def get_hyperparams():
     ]
 
 
-def make_indel_model(conv1d_params, window_size, coverage_window_size=None):
+def make_indel_model(conv1d_params, window_size, n_gpus, coverage_window_size=None):
     indel = Input(shape=(2 * window_size + 1, len(BASES)), name="indel")
     inputs = [indel]
     x = indel
@@ -496,7 +500,12 @@ def make_indel_model(conv1d_params, window_size, coverage_window_size=None):
     x = Dense(units=64, kernel_initializer='normal', activation='relu')(x)
     prob_output = Dense(units=2, kernel_initializer='normal', activation='softmax')(x)
 
-    model = Model(inputs=inputs, outputs=[prob_output])
+    if n_gpus > 1:
+        with tf.device('/cpu:0'):
+            model = Model(inputs=inputs, outputs=[prob_output])
+    else:
+        model = Model(inputs=inputs, outputs=[prob_output])
+        model = multi_gpu_model(model, gpus=n_gpus)
 
     sgd = SGD(lr=0.001, decay=1e-6, momentum=0.9, nesterov=True, clipnorm=0.5)
     adamo = Adam(lr=0.001, beta_1=0.9, beta_2=0.999, epsilon=1e-08, clipnorm=1.)
@@ -820,6 +829,7 @@ if __name__ == '__main__':
     parser.add_argument('--coverage_window_size', help='Size of the window to consider on each side of the indel for the coverage track (default 30). If set to 0, then no convolution is run.',
                         required=False, default=30, type=int)
     parser.add_argument('--tune_hyperparams', help='tune hyperparameters hardcoded for now...', action='store_true')
+    parser.add_argument("-g", "--gpus", type=int, default=1, help="# of GPUs to use for training")
 
     args = parser.parse_args()
 
